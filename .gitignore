@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# PRIVATE DATA — never commit scanned vouchers, receipts, or their outputs.
+# These contain personal and financial information (names, ID numbers,
+# bank details, photos). Ignore ALL PDFs by default, then allow only the
+# user guide back in.
+# ---------------------------------------------------------------------------
+*.pdf
+!Tutorial.pdf
+
+# Scan bundles / outputs (redundant with *.pdf, kept for clarity)
+Q*_5_Vouchers_No_*.pdf
+Q*_6_Voucher_*.pdf
+
+# Test fixtures (real scans — keep local only)
+test/
+
+# Scratch / build artifacts
+_tmp/
+__pycache__/
+*.pyc
+*.pyo
+
+# OS cruft
+.DS_Store
+Thumbs.db
