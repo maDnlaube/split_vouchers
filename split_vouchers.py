@@ -102,7 +102,6 @@ sanity-checked.
 from __future__ import annotations
 
 import argparse
-import io
 import os
 import platform
 import re
@@ -118,9 +117,11 @@ def _missing_dep(name: str) -> None:
     sys.stderr.write(
         f"\nERROR: the '{name}' package is not installed for this Python interpreter.\n"
         f"  Interpreter in use: {sys.executable}\n\n"
-        "Install the required packages into THIS interpreter with:\n"
-        f'  "{sys.executable}" -m pip install pymupdf pytesseract Pillow\n'
+        "Install the required Python packages into THIS interpreter with:\n"
+        f'  "{sys.executable}" -m pip install pymupdf Pillow\n'
         "  (add --break-system-packages on macOS if pip refuses)\n\n"
+        "Note: Tesseract OCR and Ghostscript are separate SYSTEM binaries,\n"
+        "not pip packages -- install them per the README/Tutorial if missing.\n\n"
         "If you are running this from VS Code, the interpreter shown in the\n"
         "bottom-right status bar is the one being used -- either install into\n"
         "it (command above), or switch to one that already has the packages.\n"
@@ -174,6 +175,16 @@ VOUCHER_NO_DPI = 400         # top-right crop OCR for voucher number
 #   the digit "0" is regularly read as "O" or "Q" by Tesseract on small
 #   footer text, "1" as "l" or "I", and "2" as "Z". The classes below are
 #   case-insensitive (the patterns themselves carry re.I).
+#
+# BOTH digits of every two-digit code are REQUIRED (no optional tens digit).
+# The printed footer always shows both (e.g. "(D 07)", "(D 12)"), so a
+# pattern that allowed the tens digit to be dropped caused cross-code
+# collisions on degraded OCR: "(D2)" matched D02 ("skip") before D12/D22
+# and silently dropped the page; "(D7)"/"(D0)"/"(D1)" promoted supporting
+# forms (D17/D20/D21) into D07/D10/D11 mains. With both digits required, a
+# footer degraded enough to lose a digit simply falls through to the
+# body-text fingerprint, and worst case defaults to "receipt" (kept,
+# attached to the current voucher) rather than being dropped or misrouted.
 _D0 = r"[0oq]"   # zero
 _D1 = r"[1li]"   # one
 _D2 = r"[2z]"    # two
@@ -181,26 +192,26 @@ _D2 = r"[2z]"    # two
 FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
     # --- Skipped --------------------------------------------------------
     "D02": (
-        re.compile(rf"\(\s*d\s*{_D0}?{_D2}\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D0}{_D2}\s*\)", re.I),
         re.compile(r"project\s+funds\s+report|forecast", re.I),
         "skip",
     ),
     # --- Driver's log (TF3) --------------------------------------------
     # Primary detection is by perceptual hash; this is a text-based fallback.
     "D04": (
-        re.compile(rf"\(\s*d\s*{_D0}?4\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D0}4\s*\)", re.I),
         re.compile(r"fahrtenbuch|driver.?s\s+log", re.I),
         "fahrtenbuch",
     ),
     # --- TF4 Exception forms -------------------------------------------
     "D06": (
-        re.compile(rf"\(\s*d\s*{_D0}?6\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D0}6\s*\)", re.I),
         re.compile(r"incident\s+report[\s\-]?voucher", re.I),
         "supporting",  # incident reports attach to a related main voucher
     ),
     # --- TF1 Universal Standard (main) ---------------------------------
     "D07": (
-        re.compile(rf"\(\s*d\s*{_D0}?7\s*\)|d\s*{_D0}?7[\s\-]+standard", re.I),
+        re.compile(rf"\(\s*d\s*{_D0}7\s*\)|d\s*{_D0}7[\s\-]+standard", re.I),
         re.compile(r"universal\s+d\s*[o0q]?7\s+standard|"
                    r"standar[a-z\-\s]{0,4}voucher", re.I),
         "main",
@@ -213,8 +224,8 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
     # main. The body fingerprint excludes the extension-list title
     # ("Extension-List to Activity-voucher") which would otherwise collide.
     "D08": (
-        re.compile(rf"\(\s*d\s*{_D0}?8\s*\)|d\s*{_D0}?8[\s\-]+activity|"
-                   rf"activity\s*\(\s*d\s*{_D0}?8\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D0}8\s*\)|d\s*{_D0}8[\s\-]+activity|"
+                   rf"activity\s*\(\s*d\s*{_D0}8\s*\)", re.I),
         re.compile(r"(?<!to )activity[\s\-]?voucher", re.I),
         "main_or_cont_d08",
     ),
@@ -230,21 +241,21 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
     ),
     # --- TF2.3 Travel (main; multi-page via main_or_cont) --------------
     "D10": (
-        re.compile(rf"\(\s*d\s*{_D1}?{_D0}\s*\)|d\s*{_D1}{_D0}[\s\-]+travel", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}{_D0}\s*\)|d\s*{_D1}{_D0}[\s\-]+travel", re.I),
         re.compile(r"travel[\s\-]?voucher|"
                    r"travel\s*\(\s*d\s*[1li]?[0oq]\s*\)", re.I),
         "main_or_cont",
     ),
     # --- TF4 Substitute (main: replaces a missing payment voucher) -----
     "D11": (
-        re.compile(rf"\(\s*d\s*{_D1}?{_D1}\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}{_D1}\s*\)", re.I),
         re.compile(r"substitute[\s\-]?voucher|"
                    r"internal[\s\-]voucher\s+replaces", re.I),
         "main",
     ),
     # --- TF3 Reimbursement private km (main) ---------------------------
     "D12": (
-        re.compile(rf"\(\s*d\s*{_D1}?{_D2}\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}{_D2}\s*\)", re.I),
         re.compile(r"private\s+mileage(?:\s+km)?|"
                    r"reimbursement\s+private\s+km|"
                    r"private\s+reimbursement\s+of\s+project[\s\-]?vehicle", re.I),
@@ -252,7 +263,7 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
     ),
     # --- TF4 Hospitality (main) ----------------------------------------
     "D13": (
-        re.compile(rf"\(\s*d\s*{_D1}?3\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}3\s*\)", re.I),
         re.compile(r"hospitality[\s\-]?voucher|hospitality\s+costs", re.I),
         "main",
     ),
@@ -266,52 +277,52 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
     ),
     # --- TF2.1 Collective (main) ---------------------------------------
     "D15": (
-        re.compile(rf"\(\s*d\s*{_D1}?5\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}5\s*\)", re.I),
         re.compile(r"collectiv[a-z\-\s]{0,4}voucher", re.I),
         "main",
     ),
     # --- TF2.3 Foreign daily allowance reference (supporting) ----------
     "D16": (
-        re.compile(rf"\(\s*d\s*{_D1}?6\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}6\s*\)", re.I),
         re.compile(r"overseas\s+daily\s+allowance|auslandstagegeld|"
                    r"foreig[a-z\.]*\s*daily\s*allow", re.I),
         "supporting",
     ),
     # --- TF5 Procurement (always supporting per user rule) -------------
     "D17": (
-        re.compile(rf"\(\s*d\s*{_D1}?7\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}7\s*\)", re.I),
         re.compile(r"procurement\s+voucher|direct\s+award", re.I),
         "supporting",
     ),
     # --- TF5 Inventory list (always supporting per user rule) ----------
     "D18": (
-        re.compile(rf"\(\s*d\s*{_D1}?8\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}8\s*\)", re.I),
         re.compile(r"inventory\s+list|inventory\s+number", re.I),
         "supporting",
     ),
     # --- TF5 Segregation (always supporting per user rule) -------------
     "D19": (
-        re.compile(rf"\(\s*d\s*{_D1}?9\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D1}9\s*\)", re.I),
         re.compile(r"segregation\s+report|date\s+of\s+segregation", re.I),
         "supporting",
     ),
     # --- TF5 Handover (always supporting per user rule) ----------------
     "D20": (
-        re.compile(rf"\(\s*d\s*{_D2}?{_D0}\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D2}{_D0}\s*\)", re.I),
         re.compile(r"handover\s+report|"
                    r"hand[\s\-]?over\s+to\s+the\s+a\.?m\.?", re.I),
         "supporting",
     ),
     # --- TF3 Reimbursement private Euro expenses (supporting) ----------
     "D21": (
-        re.compile(rf"\(\s*d\s*{_D2}?{_D1}\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D2}{_D1}\s*\)", re.I),
         re.compile(r"reimbursement\s+private(?!\s+km)|"
                    r"private\s+euro\s+expenses", re.I),
         "supporting",
     ),
     # --- TF2.3 Per-diem overview (supporting) --------------------------
     "D22": (
-        re.compile(rf"\(\s*d\s*{_D2}?{_D2}\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D2}{_D2}\s*\)", re.I),
         re.compile(r"per\s+diem\s+overview", re.I),
         "supporting",
     ),
@@ -335,6 +346,17 @@ D08_PAGE2_PAT = re.compile(
     re.I,
 )
 
+# D08 activity-voucher PAGE-1 HEADER markers, used by identify_form Pass 1b
+# as a footer-less fallback (see there). These three fields appear ONLY on
+# the activity-voucher header and NEVER on the D09 extension list, which
+# shares the A./B./C. budget-table headers but carries no activity header.
+# (Deliberately NOT "A. Transport"/"C. Meals" -- shared with D09 -- nor
+# "Objectives" -- it leaks onto activity-report supporting docs.)
+D08_ACTIVITY_HEADER_PAT = re.compile(
+    r"theme\s*/?\s*titel|topic\s+of\s+the\s+activ|\b5\.\s*activit",
+    re.I,
+)
+
 # The D09 Extension-List form's title reads "Extension-List to
 # Activity-voucher". The "Activity-voucher" substring would otherwise be
 # captured by the D08 body fingerprint, so identify_form() matches this
@@ -348,16 +370,20 @@ EXTENSION_LIST_PAT = re.compile(
 )
 
 # Captures the printed value of the "Voucher N°" cell (top-right of forms).
-VOUCHER_NO_PAT = re.compile(r"voucher\s*n[°o\*\.\s]*\W{0,3}(\d{2,4})", re.I)
+# The digit group is bounded by non-digit look-arounds so a 5+ digit noisy
+# run (two glued numbers, a stray stroke) is REJECTED rather than truncated
+# to a 2-4 digit prefix that might fall in range and bypass the safety net.
+VOUCHER_NO_PAT = re.compile(r"voucher\s*n[°o\*\.\s]*\W{0,3}(?<!\d)(\d{2,4})(?!\d)", re.I)
 
-# Multi-page form footer markers: "1/2", "2 / 2", "1 of 3", "2 von 3".
+# Multi-page form footer markers, slash form only: "1/2", "2 / 2".
 # Used to force the page(s) following a "1/N" main into "main_cont", because
 # continuation pages of e.g. D08 sometimes lose their D-code title to layout
 # overlap and would otherwise be mis-classified as receipt/supporting.
-PAGE_MARKER_PAT = re.compile(
-    r"\b([1-9])\s*(?:/|of|von)\s*([1-9])\b",
-    re.I,
-)
+# The earlier "n of m" / "n von m" word forms were dropped: they match
+# ordinary receipt prose ("3 of 5 copies") and produced spurious markers
+# that could fold a receipt into the main sheet. A genuine word-form
+# continuation is still recovered by the D08 always-2-page fallback.
+PAGE_MARKER_PAT = re.compile(r"\b([1-9])\s*/\s*([1-9])\b")
 
 # Receipt-like keyword fingerprints (third-party documents). Used by the
 # fall-through heuristic to disambiguate "no D-code recognised" pages.
@@ -436,6 +462,66 @@ OFFICIAL_LETTER_PAT = re.compile(
     r"autorizasaun|authorizasaun",
     re.I,
 )
+
+# Participant / attendance lists (signed lists attached to activity
+# vouchers) are SUPPORTING documents, but they OCR to little more than a
+# letterhead plus handwritten rows, so the multi-hit looks_supporting()
+# heuristic often misses them. Detected two ways (see looks_like_participant_list):
+#
+#  (a) TITLE -- an unambiguous single-hit signal, multi-lingual.
+#      NB: the bare phrase "participants list" is deliberately EXCLUDED -- the
+#      D08 activity voucher itself prints "attach a signed participants list",
+#      and matching that could mislabel a degraded D08. We match the list's
+#      own titles ("List of Participants", "Lista Partisipante", Portuguese
+#      "Lista Presença", Indonesian "Daftar Hadir", German attendance list).
+PARTICIPANT_LIST_PAT = re.compile(
+    r"list\s+of\s+participant|lista\s+partisipante|"
+    r"lista\s+de\s+participantes|lista\s+(?:de\s+)?presen[cç]|"
+    r"attendance\s+(?:list|sheet)|presence\s+list|"
+    r"daftar\s+hadir|teilnehmerliste|anwesenheitsliste",
+    re.I,
+)
+
+#  (b) STRUCTURE -- the typical column layout of such a list: a name column,
+#      a position/structure column, a signature/contact column, etc., laid
+#      out as a table. We recognise it by the COLUMN-HEADER vocabulary below;
+#      two or more DISTINCT column words on one page indicate a list table.
+#      These words are list-specific (Tetum form headers + Portuguese/English
+#      name/signature headers) and rare on receipts, so requiring two keeps
+#      false positives off invoices. A signed list usually also repeats the
+#      institutional header on each page, but the column headers are the
+#      structural fingerprint.
+PLIST_COL_PAT = re.compile(
+    r"\b(?:naran|pozisaun|instituisaun|organizasaun|kontaktu|asinatura|"
+    r"assinatura|tanda\s+tangan|nome\s+completo|estrutura|"
+    r"presen[cç]a|semester|curso|"
+    r"signature|organisation|institution)\b",
+    re.I,
+)
+
+
+def looks_like_participant_list(text: str) -> bool:
+    """True for a participant / attendance / signature list page.
+
+    Matches either the list's TITLE (one hit, unambiguous) or its
+    structural COLUMN layout (>= 2 distinct list-column header words).
+    Used by identify_form's fall-through and as the trigger for the
+    continuation-propagation pass.
+
+    The structural branch is GATED by `not looks_like_receipt`: a
+    third-party receipt (e.g. a "FATURA / invoice and cash receipt") also
+    prints a customer "Naran / Name" field and an "Asinatura / signature"
+    line, so without this gate those columns would mis-flag the receipt as
+    a list. A real receipt's invoice/total keywords win and keep it in _2.
+    """
+    if not text:
+        return False
+    norm = text.lower()
+    if PARTICIPANT_LIST_PAT.search(norm):
+        return True
+    if looks_like_receipt(text):
+        return False
+    return len({m.group(0).strip() for m in PLIST_COL_PAT.finditer(norm)}) >= 2
 
 # Source filename: Q<q><yy>_5_Vouchers_No_<start>-<end>.pdf
 # e.g. Q126_5_Vouchers_No_238-241.pdf, Q227_5_Vouchers_No_12-19.pdf
@@ -538,9 +624,14 @@ def locate_ghostscript() -> str:
     extras: list[Path] = []
     if platform.system() == "Windows":
         # Ghostscript installs to versioned subdirs; pick the newest available.
+        # Sort by PARSED version, not lexicographically -- string sorting puts
+        # "gs9.55" above "gs10.00" ('9' > '1'), picking the older release.
+        def _gs_ver(p: Path) -> tuple[int, int]:
+            m = re.search(r"(\d+)\.(\d+)", p.name)
+            return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
         for base in [Path(r"C:\Program Files\gs"), Path(r"C:\Program Files (x86)\gs")]:
             if base.exists():
-                for sub in sorted(base.iterdir(), reverse=True):
+                for sub in sorted(base.iterdir(), key=_gs_ver, reverse=True):
                     for exe in ("gswin64c.exe", "gswin32c.exe"):
                         cand = sub / "bin" / exe
                         if cand.exists():
@@ -572,6 +663,14 @@ def _run_tesseract(png_path: Path, psm: int = 6,
     if whitelist:
         args.extend(["-c", f"tessedit_char_whitelist={whitelist}"])
     out = subprocess.run(args, capture_output=True, timeout=180)
+    # A non-zero exit (missing langpack, OOM-killed child, bad PSM) yields
+    # empty stdout that is indistinguishable from "blank page" and would
+    # silently disable every detector. Surface it as a one-line stderr
+    # warning, but do NOT raise -- one bad page must not abort the file.
+    if out.returncode != 0:
+        err = (out.stderr or b"").decode("utf-8", errors="replace").strip()
+        last = err.splitlines()[-1] if err else f"exit code {out.returncode}"
+        print(f"  !! tesseract failed on {png_path.name}: {last}", file=sys.stderr)
     raw = out.stdout or b""
     return raw.decode("utf-8", errors="replace")
 
@@ -609,6 +708,13 @@ def page_phash(page: fitz.Page, size: int = 16) -> str:
 
 
 def hamming(a: str, b: str) -> int:
+    # NB: the comparison over the overlapping prefix (via zip) is
+    # INTENTIONAL and load-bearing. FAHRTENBUCH_HASH is 272 bits (its
+    # template was captured at a 16x17 grid) while page_phash() returns
+    # 256 bits (16x16); the Fahrtenbuch check relies on comparing the
+    # aligned top 16 rows. A landscape driver's log whose OCR and footer
+    # are unreadable is detected by THIS hash alone, so do not "guard"
+    # unequal lengths away -- doing so silently drops those pages.
     return sum(x != y for x, y in zip(a, b))
 
 
@@ -624,16 +730,39 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
          Activity-voucher" contains "Activity-voucher", which would
          otherwise be captured by the D08 body fingerprint. Resolve it
          first so an extension list is never mistaken for a D08 main.
-      1. Footer D-code regex (highest confidence).
+      1. Footer D-code regex (highest confidence) -- the printed voucher
+         code, e.g. "(D 08)".
+      1b. D08 activity-voucher CONTENT fallback -- used ONLY when the
+         footer yielded no D-code (see below).
       2. Body keyword fallback (used only if no footer matched).
     """
     norm = " ".join((text or "").lower().split())
     # Pass 0 -- extension-list title/footer override (D09 supporting).
     if EXTENSION_LIST_PAT.search(norm):
         return "D09", "supporting"
+    # Pass 1 -- footer D-code (preferred signal, always wins when present).
     for code, (footer_re, _body_re, cat) in FORM_PATTERNS.items():
         if footer_re.search(norm):
             return code, _resolve_category(cat, norm)
+    # Pass 1b -- D08 activity-voucher CONTENT fallback.
+    #   The newer "(D08+D09 extension list)" template prints its FILE PATH
+    #   in the footer; that path text both (a) fails the D08 footer code
+    #   "(D08)" -- so Pass 1 finds nothing -- and (b) contains the literal
+    #   words "extension list", which the D09 body fingerprint would grab
+    #   in Pass 2 whenever the "Activity-voucher" title OCRs poorly,
+    #   silently misfiling the activity voucher as a D09 supporting page.
+    #   So, ONLY when the footer gave no D-code, fall back to the activity
+    #   voucher's HEADER fields (Theme/Titel, Topic of the activity,
+    #   5. Activities) -- markers that appear on the activity-voucher
+    #   page 1 but NEVER on the D09 extension list (which shares the
+    #   A./C. budget-table headers, so those can't be used here). The
+    #   page-2 continuation is picked up afterwards by the D08 always-2-page
+    #   post-pass. A clearly-read footer D-code above always takes priority;
+    #   the proper user-side fix is to keep the printed voucher code in the
+    #   footer clear of the file path.
+    if D08_ACTIVITY_HEADER_PAT.search(norm):
+        return "D08", "main"
+    # Pass 2 -- body keyword fallback.
     for code, (_footer_re, body_re, cat) in FORM_PATTERNS.items():
         if body_re.search(norm):
             return code, _resolve_category(cat, norm)
@@ -642,9 +771,12 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
     # list, workshop agenda/itinerary, etc.) which would otherwise be
     # mis-categorised when the user stacks the bundle as
     # main / supporting / receipts instead of main / receipts / supporting.
-    # Official letters / declarations (single distinctive hit) and the
-    # multi-hit agenda/participant heuristic both route to supporting.
-    if OFFICIAL_LETTER_PAT.search(norm) or looks_supporting(norm):
+    # Official letters / declarations, participant/attendance lists (by
+    # title OR table structure) and the multi-hit agenda/participant
+    # heuristic all route to supporting.
+    if (OFFICIAL_LETTER_PAT.search(norm)
+            or looks_like_participant_list(norm)
+            or looks_supporting(norm)):
         return None, "supporting"
     return None, "receipt"
 
@@ -716,7 +848,7 @@ def extract_voucher_number(page: fitz.Page,
     for psm in (7, 8, 11):
         digit_text = ocr_page(page, dpi=VOUCHER_NO_DPI, psm=psm, clip=clip,
                               whitelist="0123456789").strip()
-        for token in re.findall(r"\d{2,4}", digit_text):
+        for token in re.findall(r"(?<!\d)\d{2,4}(?!\d)", digit_text):
             try:
                 n = int(token)
                 if 1 <= n <= 9999:
@@ -738,11 +870,16 @@ def extract_voucher_number(page: fitz.Page,
         # like 54 when the range is 561-576.
         in_range = [c for c in candidates if lo <= c <= hi]
         if in_range:
-            # Most-frequent in-range candidate (multi-PSM consensus).
+            # Most-frequent in-range candidate (multi-PSM consensus). On a
+            # genuine tie (no single value has the highest vote) the read is
+            # ambiguous -- return None so process_file() uses the page's
+            # positional number rather than arbitrarily biasing toward lo.
             counts: dict[int, int] = {}
             for c in in_range:
                 counts[c] = counts.get(c, 0) + 1
-            return max(counts, key=lambda k: (counts[k], -abs(k - lo)))
+            top = max(counts.values())
+            winners = [k for k, v in counts.items() if v == top]
+            return winners[0] if len(winners) == 1 else None
         # No in-range candidates -- the OCR clearly failed. Returning
         # None lets process_file() use position-based sequential numbering.
         return None
@@ -963,8 +1100,13 @@ def write_subset(src: fitz.Document, page_indices: list[int], out_path: Path) ->
         f"-sOutputFile={out_path}",
         str(tmp_pdf),
     ]
-    subprocess.run(gs_cmd, check=True)
-    tmp_pdf.unlink(missing_ok=True)
+    # timeout: a malformed PDF can make Ghostscript loop forever, hanging an
+    # unattended batch with no error. finally: always remove the uncompressed
+    # temp, even if gs raises/times out, so it is never left in the folder.
+    try:
+        subprocess.run(gs_cmd, check=True, timeout=300)
+    finally:
+        tmp_pdf.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1079,7 +1221,10 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                                    if marker_tuple else None),
                         "marker_tuple": marker_tuple,
                         "photo_score": pscore,
-                        "phash": ph}
+                        "phash": ph,
+                        # flags for the participant-list continuation pass
+                        "is_plist": looks_like_participant_list(text),
+                        "strong_receipt": looks_like_receipt(text)}
 
         page_info.append(info)
         snippet = " ".join(text.split())[:80] if text else ""
@@ -1150,6 +1295,37 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                 print(f"  -> p{b['page']+1:02d} forced to main_cont "
                       f"(duplicate scan of p{a['page']+1:02d})")
 
+    # 1d. Post-pass: participant-list continuation propagation.
+    #     A multi-page signed participant/attendance list is detectable on
+    #     its first (titled / column-headed) page, but the continuation
+    #     pages OCR to little more than handwriting and would default to
+    #     "receipt". Per the bundle convention (main -> receipts ->
+    #     supporting, lists last) and the user's rule that participant
+    #     lists behave like the D09 extension list (always _3, attached to
+    #     the activity voucher), once a participant-list page is seen we
+    #     carry "supporting" forward through the immediately-following
+    #     receipt-default pages until the block clearly ends.
+    #     Strictly bounded so it never swallows a real receipt:
+    #       - starts ONLY at a detected participant-list page (is_plist),
+    #       - propagates ONLY to "receipt" pages WITHOUT strong receipt
+    #         keywords (a real invoice/slip breaks the run and stays _2),
+    #       - resets at any main/continuation/fahrtenbuch/skip boundary and
+    #         at any non-participant supporting page (photo, itinerary).
+    in_plist_block = False
+    for info in page_info:
+        cat = info["cat"]
+        if cat in ("main", "main_cont", "fahrtenbuch", "skip"):
+            in_plist_block = False
+        elif info.get("is_plist"):
+            in_plist_block = True            # already classified supporting
+        elif (cat == "receipt" and in_plist_block
+              and not info.get("strong_receipt")):
+            info["cat"] = "supporting"        # continuation of the list block
+            print(f"  -> p{info['page']+1:02d} -> supporting "
+                  f"(participant-list continuation)")
+        else:
+            in_plist_block = False            # strong receipt / other doc ends it
+
     # 2. group pages into voucher buckets (one per main)
     #
     # Voucher numbering: when extract_voucher_number() returned a value
@@ -1180,7 +1356,11 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
             continue
         if cat == "main":
             vnum = info["vnum"] if info["vnum"] is not None else next_seq
-            next_seq = vnum + 1
+            # Advance the positional counter by exactly one per main, NEVER
+            # re-anchored to the OCR read. A single wrong-but-in-range read
+            # then mislabels only its own page instead of shifting (and
+            # possibly colliding) every later voucher number.
+            next_seq += 1
             groups.append({"vnum": vnum, "form": info["form"],
                            "main": [i], "receipt": [], "supporting": []})
         elif cat == "main_cont":
@@ -1212,6 +1392,20 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
             print(f"  driver's log p{[p+1 for p in deferred_fahrtenbuch]} -> "
                   f"ignored (no D12 voucher in this file)")
 
+    # 3b. Guard against duplicate voucher numbers. A wrong-but-in-range OCR
+    #     read can land on another main's number; two groups sharing a vnum
+    #     would write the same Q..._6_Voucher_<vnum>_*.pdf and the second
+    #     would silently overwrite the first (Ghostscript -sOutputFile
+    #     truncates). On any collision, fall back to position-based
+    #     sequential numbering from range_start -- the filename range is the
+    #     ground truth for a contiguous bundle -- so every output is unique.
+    vnums = [g["vnum"] for g in groups]
+    if len(set(vnums)) != len(vnums):
+        print(f"  !! WARNING: duplicate voucher numbers {vnums} -- "
+              f"renumbering sequentially from {range_start}.")
+        for offset, g in enumerate(groups):
+            g["vnum"] = range_start + offset
+
     # 4. sanity-check
     if len(groups) != expected_count:
         print(f"  !! WARNING: detected {len(groups)} main vouchers; "
@@ -1222,9 +1416,19 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
     out_dir = src_path.parent
     for g in groups:
         vnum = g["vnum"]
+        # Flag vouchers that end up with no _2 receipt file. A faint
+        # receipt glued onto the voucher page (a scanning user-error) is
+        # NOT reliably detectable on the page itself -- it OCRs to almost
+        # nothing and carries no continuous-tone content -- so the only
+        # robust signal is structural: the voucher has a main but no
+        # separate receipt. The page is still (correctly) sorted to _1;
+        # this flag prompts the operator to check whether a receipt was
+        # glued onto the voucher sheet or is genuinely missing.
+        no_receipt = "  [!] no _2 receipt -- receipt may be glued onto the voucher page or missing" \
+            if not g["receipt"] else ""
         print(f"  voucher {vnum}: main={[p+1 for p in g['main']]}, "
               f"receipts={[p+1 for p in g['receipt']]}, "
-              f"supporting={[p+1 for p in g['supporting']]}")
+              f"supporting={[p+1 for p in g['supporting']]}{no_receipt}")
         if dry_run:
             continue
         for suffix, kind in [("1", "main"), ("2", "receipt"), ("3", "supporting")]:
@@ -1271,8 +1475,18 @@ def main() -> None:
     if not pdfs:
         sys.exit(f"No input PDFs matched in {args.folder} (pattern '{INPUT_GLOB}').")
 
+    failures = 0
     for pdf in pdfs:
-        process_file(pdf, dry_run=args.dry_run)
+        # Isolate each file: a corrupt/encrypted PDF, a Tesseract timeout, a
+        # Ghostscript error or a MemoryError must not abort the remaining
+        # files. Report it and keep going; exit non-zero so callers notice.
+        try:
+            process_file(pdf, dry_run=args.dry_run)
+        except Exception as e:
+            failures += 1
+            print(f"!! FAILED {pdf.name}: {type(e).__name__}: {e}", file=sys.stderr)
+    if failures:
+        sys.exit(f"\n{failures} file(s) failed -- see messages above.")
 
 
 if __name__ == "__main__":
