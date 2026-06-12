@@ -10,7 +10,7 @@ REM    2. Tesseract OCR from https://github.com/UB-Mannheim/tesseract/wiki
 REM       (default install path: C:\Program Files\Tesseract-OCR\)
 REM    3. Ghostscript from https://www.ghostscript.com/releases/gsdnld.html
 REM       (default install path: C:\Program Files\gs\<version>\bin\)
-REM    4. Python packages:  py -m pip install pymupdf pytesseract Pillow
+REM    4. Python packages:  py -m pip install pymupdf Pillow
 REM ---------------------------------------------------------------
 
 setlocal

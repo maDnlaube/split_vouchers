@@ -39,15 +39,14 @@ for any quarter and year.
 ## Requirements (one-time install)
 
 - **Python 3.9+**
-- **Tesseract OCR**
-- **Ghostscript**
-- Python packages: `pymupdf`, `pytesseract`, `Pillow`
+- **Tesseract OCR** and **Ghostscript** (system binaries, not pip packages)
+- Python packages: `pymupdf`, `Pillow`
 
 **macOS**
 
 ```bash
 brew install python tesseract ghostscript
-python3 -m pip install --user --break-system-packages pymupdf pytesseract Pillow
+python3 -m pip install --user --break-system-packages pymupdf Pillow
 ```
 
 **Windows** — install Python (tick *Add python.exe to PATH*), Tesseract OCR
@@ -55,7 +54,7 @@ python3 -m pip install --user --break-system-packages pymupdf pytesseract Pillow
 installers, then:
 
 ```bat
-py -m pip install pymupdf pytesseract Pillow
+py -m pip install pymupdf Pillow
 ```
 
 ## Usage

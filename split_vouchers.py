@@ -25,84 +25,42 @@ Q<q><yy>_6_*.pdf files appear next to them.
 Classification logic (most -> least specific)
 =============================================
 
-1. Driver's log (Fahrtenbuch) is identified by perceptual-hash similarity
-   to a known template OR by a text-based fingerprint (matches German
-   "Fahrtenbuch" / English "driver's log" / column-header pair "Km Start"
-   ... "Km Ende", etc.) -- either signal alone is sufficient, so a
-   handwritten / rotated / poorly-scanned page that drifts from the
-   template still gets caught. Each Fahrtenbuch page is attached to the
-   NEAREST PRECEDING D12 ("Reimbursement private km") main voucher; this
-   correctly distributes log pages across multiple D12 vouchers in the
-   same bundle. Pages that came before any D12 are deferred and attached
-   to the first D12 found, or dropped if none exists.
+1. Driver's log (Fahrtenbuch): perceptual-hash match against a template
+   OR text fingerprint ("Fahrtenbuch", "driver's log", column headers) --
+   either alone suffices, so degraded/rotated scans still get caught.
+   Attached to the NEAREST PRECEDING D12 main; pages before any D12 are
+   deferred to the first D12 found, or dropped if none exists.
 
-2. The page footer is OCR'd; a recognised D-code drives the category:
+2. The OCR'd footer D-code drives the category: D02 skip (per user);
+   D07/D11/D12/D13/D15 main; D10 main with continuations folded into the
+   same _1; D06/D09/D14/D16-D22 supporting.
 
-      D02   project funds report           -> SKIPPED entirely (per user)
-      D07   universal standard voucher     -> MAIN
-      D10   travel voucher (page 1)        -> MAIN
-      D10   travel voucher (continuation)  -> MAIN-continuation (folded
-                                              into the same _1 file)
-      D12   reimbursement private km       -> MAIN
-      D14   payment voucher private phone  -> SUPPORTING
-      D15   collective voucher             -> MAIN
-      D17   procurement voucher            -> SUPPORTING
-      D21   reimbursement private (EUR)    -> SUPPORTING
-      D22   per diem overview              -> SUPPORTING
+3. No D-code: default is receipt, flipped to supporting when the page
+   reads like an internal document -- participant list (title or column
+   structure), agenda/itinerary keyword consensus, official letter or
+   declaration, or contract package (title/legal-boilerplate phrases,
+   vetoed by an actual receipt heading so an invoice that merely
+   references the contract stays _2). Photograph-like pages (largest
+   contiguous continuous-tone region of a deterministic fixed-DPI
+   render) also flip to supporting unless strong multi-lingual receipt
+   keywords (incl. telecom prepaid cards) say otherwise.
 
-3. Pages without a recognised D-code are checked against a supporting-
-   document keyword fingerprint (participant lists, workshop agendas /
-   itineraries, session plans, multi-lingual). A conservative match
-   flips the page from the RECEIPT default to SUPPORTING. Contract /
-   formal-agreement pages (e.g. a multi-page "Consultancy Contract"
-   whose payment clauses mention invoices, totals and reimbursable
-   expenses) are recognised by title / legal-boilerplate phrases and
-   routed to SUPPORTING -- unless the page carries an actual receipt
-   heading, in which case it is a receipt that merely references the
-   contract (see looks_like_contract). Pages that
-   look like photographs are also flipped to SUPPORTING -- BUT ONLY if
-   the OCR text does not contain strong receipt keywords. Photograph
-   detection RENDERS the page (deterministic across OS) and measures the
-   largest contiguous region of continuous-tone pixels -- big for a
-   photo or scanned ID card, near-zero for a text document -- so a small
-   photo on a mostly-white page is still caught (see photo_region_score).
-   The receipt keyword gate (positive matching against multi-lingual
-   receipt vocabulary, including telecom prepaid cards like "telemor",
-   "Konsulta saldu", "scratch card") protects colourful printed receipts
-   from being mis-flipped.
+4. Multi-page mains print "k/N" footer markers: a non-main page with
+   (k>=2, N) re-attaches to the most recent main -- only if that main
+   advertised its own (1, N) and no intervening page claims a competing
+   (1, N). D08 is ALWAYS a 2-page form: its continuation is force-
+   attached (marker first; next-non-main fallback for canonical order).
 
-4. Multi-page main forms (notably D08) print "1/N" / "2/N" markers in
-   the footer. Any non-main page with marker (k>=2, N) is attached to
-   the most recent main voucher -- but ONLY if that main has its own
-   matching (1, N) marker AND no intervening page is advertising a
-   competing (1, N) of its own.
-   D08 specifically is ALWAYS a 2-page form by template. After the
-   marker pass, every D08 main has its continuation force-attached:
-   we prefer marker-based detection (handles scrambled bundles), and
-   fall back to "the immediately next non-main page is the continuation"
-   for canonical-order bundles where the marker OCR also failed.
-
-5. Duplicate consecutive main pages (same D-code, near-identical
-   perceptual hash) -- e.g. when a user accidentally scans a voucher
-   form twice -- are merged automatically: the second copy is demoted
-   to main_cont and folded into the same _1 file as the first.
+5. Duplicate consecutive mains (same D-code, near-identical hash, e.g.
+   an accidental rescan) merge: the second page demotes to main_cont.
 
 Voucher numbering
 =================
-For each MAIN page we OCR the top-right "Voucher N°" cell with FOUR
-Tesseract layout modes (PSM 6 prose, PSM 7 single line + digit
-whitelist, PSM 8 single word + digit whitelist, PSM 11 sparse text +
-digit whitelist) and collect every plausible candidate. Multi-PSM
-agreement gives strong handwriting-recognition robustness.
-
-Candidates are validated against the bundle's expected range (parsed
-from the filename, e.g. 561-576). An out-of-range read like "54" when
-the range is 561-576 is treated as an OCR error and discarded -- the
-sequential fallback (anchored to range_start) takes over.
-
-If the detected MAIN count differs from the expected count, the script
-still produces output but emits a warning so the result can be
-sanity-checked.
+The top-right "Voucher N°" cell is OCR'd under four Tesseract layout
+modes (PSM 6/7/8/11, digit whitelists); multi-PSM agreement handles
+handwriting. Candidates outside the filename's range are discarded and
+sequential numbering (anchored to range_start, advanced once per main)
+takes over. A main-count/filename mismatch emits a warning.
 """
 
 from __future__ import annotations
@@ -160,37 +118,19 @@ VOUCHER_NO_DPI = 400         # top-right crop OCR for voucher number
 # Form-code patterns (matched against OCR'd footer / body text)
 # ---------------------------------------------------------------------------
 
-# Per form, two regexes are stored:
-#   footer_pat -- the D-code printed in the page footer, e.g. "(D 09)".
-#                 Highest-confidence signal; matched FIRST across all forms.
-#   body_pat   -- a body-text fingerprint (form title, section heading, etc.).
-#                 Matched only if no footer code was recognised on the page.
+# Per form: footer_pat (the printed D-code, e.g. "(D 09)" -- highest
+# confidence, matched first) and body_pat (title/heading fallback, used only
+# when no footer code matched). Categories: "main" starts a voucher group,
+# "main_or_cont*" resolved by content, "supporting" -> _3, "fahrtenbuch"
+# -> attached to a D12, "skip" -> dropped. User rules baked in: D09
+# extension lists and all TF5 forms (D17-D20) are ALWAYS supporting.
 #
-# Categories:
-#   "main"          top-level voucher form, starts a new voucher group
-#   "main_or_cont"  D10 only -- decided by D10_PAGE1_PAT below
-#   "supporting"    supplementary form attached to most recent voucher (_3)
-#   "fahrtenbuch"   driver's log -- attached to D12 voucher if present
-#   "skip"          drop entirely
-#
-# Per-user rules baked in:
-#   - Extension lists (D09) are ALWAYS supporting (TF2.2 / TF2.3).
-#   - All TF5 forms (D17 procurement, D18 inventory, D19 segregation,
-#     D20 handover) are ALWAYS supporting.
-# OCR-confusable digit classes used inside footer patterns:
-#   the digit "0" is regularly read as "O" or "Q" by Tesseract on small
-#   footer text, "1" as "l" or "I", and "2" as "Z". The classes below are
-#   case-insensitive (the patterns themselves carry re.I).
-#
-# BOTH digits of every two-digit code are REQUIRED (no optional tens digit).
-# The printed footer always shows both (e.g. "(D 07)", "(D 12)"), so a
-# pattern that allowed the tens digit to be dropped caused cross-code
-# collisions on degraded OCR: "(D2)" matched D02 ("skip") before D12/D22
-# and silently dropped the page; "(D7)"/"(D0)"/"(D1)" promoted supporting
-# forms (D17/D20/D21) into D07/D10/D11 mains. With both digits required, a
-# footer degraded enough to lose a digit simply falls through to the
-# body-text fingerprint, and worst case defaults to "receipt" (kept,
-# attached to the current voucher) rather than being dropped or misrouted.
+# The digit classes absorb OCR confusions (0->O/Q, 1->l/I, 2->Z). BOTH
+# digits of every code are REQUIRED: an optional tens digit caused
+# cross-code collisions on degraded OCR ("(D2)" hit D02 "skip" and dropped
+# D12/D22 pages; "(D7)"/"(D0)"/"(D1)" promoted supporting forms to mains).
+# A footer missing a digit now falls through to the body fingerprint,
+# worst case defaulting to "receipt" (kept) rather than dropped/misrouted.
 _D0 = r"[0oq]"   # zero
 _D1 = r"[1li]"   # one
 _D2 = r"[2z]"    # two
@@ -223,12 +163,9 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
         "main",
     ),
     # --- TF2.2 Activity (main; ALWAYS a 2-page form) -------------------
-    # Page 1 carries the activity header + tables A/B; page 2 carries
-    # tables C/D/E. Both pages print the (D08) footer, so we resolve
-    # page-1 vs continuation by CONTENT (see D08_PAGE1_PAT / D08_PAGE2_PAT
-    # and _resolve_category) rather than treating every D08 page as a new
-    # main. The body fingerprint excludes the extension-list title
-    # ("Extension-List to Activity-voucher") which would otherwise collide.
+    # Both pages print (D08); page-1 vs continuation is resolved by CONTENT
+    # (D08_PAGE1_PAT / D08_PAGE2_PAT in _resolve_category). The body pat
+    # excludes the D09 extension-list title, which would otherwise collide.
     "D08": (
         re.compile(rf"\(\s*d\s*{_D0}8\s*\)|d\s*{_D0}8[\s\-]+activity|"
                    rf"activity\s*\(\s*d\s*{_D0}8\s*\)", re.I),
@@ -236,10 +173,8 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
         "main_or_cont_d08",
     ),
     # --- Extension list (always supporting) ----------------------------
-    # The D09 footer is frequently OCR'd with a doubled zero-like char,
-    # e.g. "(DO09)" (letter-O + digit-0 before the 9), so we allow up to
-    # two such chars. The body title "Extension-List to Activity-voucher"
-    # is matched first in identify_form() as a high-priority override.
+    # Footer often OCRs with doubled zero-like chars ("(DO09)") -- allow up
+    # to two. The body title is matched first in identify_form() (Pass 0).
     "D09": (
         re.compile(rf"\(\s*d\s*{_D0}{{0,2}}9\s*\)", re.I),
         re.compile(r"extension[\s\-]?l?ist", re.I),
@@ -337,11 +272,9 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
 # D10 page 1 carries one of these phrases; continuation pages do not.
 D10_PAGE1_PAT = re.compile(r"official\s+travel\s+by|purpose\s+of\s+travel", re.I)
 
-# D08 Activity-voucher is a fixed 2-page form.
-#   Page 1: activity header + budget tables A (Transport) / B (Accommodation).
-#   Page 2: budget tables C (Meals) / D (Fees) / E (Miscellanous) + totals.
-# A D08 page is a CONTINUATION (page 2) when it shows page-2 table headers
-# AND lacks all page-1 markers; otherwise it is treated as a page-1 main.
+# D08 page 1 = activity header + budget tables A/B; page 2 = tables C/D/E.
+# A D08 page is a continuation only when it shows page-2 headers AND lacks
+# all page-1 markers; otherwise it is treated as a page-1 main.
 D08_PAGE1_PAT = re.compile(
     r"theme\s*/?\s*titel|period\s+of\s+time|numb\w*\.?\s*o\.?\s*particip|"
     r"\b5\.\s*activit|a\.\s*transport|b\.\s*accommod|objectiv",
@@ -352,43 +285,32 @@ D08_PAGE2_PAT = re.compile(
     re.I,
 )
 
-# D08 activity-voucher PAGE-1 HEADER markers, used by identify_form Pass 1b
-# as a footer-less fallback (see there). These three fields appear ONLY on
-# the activity-voucher header and NEVER on the D09 extension list, which
-# shares the A./B./C. budget-table headers but carries no activity header.
-# (Deliberately NOT "A. Transport"/"C. Meals" -- shared with D09 -- nor
-# "Objectives" -- it leaks onto activity-report supporting docs.)
+# D08 PAGE-1 HEADER markers for identify_form Pass 1b (footer-less
+# fallback). These appear ONLY on the activity-voucher header, never on the
+# D09 list (deliberately not "A. Transport"/"C. Meals" -- shared with D09 --
+# nor "Objectives", which leaks onto activity reports).
 D08_ACTIVITY_HEADER_PAT = re.compile(
     r"theme\s*/?\s*titel|topic\s+of\s+the\s+activ|\b5\.\s*activit",
     re.I,
 )
 
-# The D09 Extension-List form's title reads "Extension-List to
-# Activity-voucher". The "Activity-voucher" substring would otherwise be
-# captured by the D08 body fingerprint, so identify_form() matches this
-# title first and routes the page straight to D09 (supporting). Tolerates
-# the common OCR dropout of the "l" ("extension-ist") and matches either
-# the title context or the footer code in parentheses.
+# The D09 title "Extension-List to Activity-voucher" contains the D08 body
+# fingerprint, so identify_form() matches it first (Pass 0) and routes the
+# page to D09 supporting. Tolerates the "l" dropout ("extension-ist").
 EXTENSION_LIST_PAT = re.compile(
     r"extension[\s\-]?l?ist\s+to\s+activ|"
     r"extension[\s\-]?l?ist\s*\(\s*d",
     re.I,
 )
 
-# Captures the printed value of the "Voucher N°" cell (top-right of forms).
-# The digit group is bounded by non-digit look-arounds so a 5+ digit noisy
-# run (two glued numbers, a stray stroke) is REJECTED rather than truncated
-# to a 2-4 digit prefix that might fall in range and bypass the safety net.
+# "Voucher N°" cell value (top-right of forms). Non-digit look-arounds
+# REJECT 5+ digit noisy runs rather than truncating to an in-range prefix.
 VOUCHER_NO_PAT = re.compile(r"voucher\s*n[°o\*\.\s]*\W{0,3}(?<!\d)(\d{2,4})(?!\d)", re.I)
 
-# Multi-page form footer markers, slash form only: "1/2", "2 / 2".
-# Used to force the page(s) following a "1/N" main into "main_cont", because
-# continuation pages of e.g. D08 sometimes lose their D-code title to layout
-# overlap and would otherwise be mis-classified as receipt/supporting.
-# The earlier "n of m" / "n von m" word forms were dropped: they match
-# ordinary receipt prose ("3 of 5 copies") and produced spurious markers
-# that could fold a receipt into the main sheet. A genuine word-form
-# continuation is still recovered by the D08 always-2-page fallback.
+# Footer page markers, slash form ONLY ("1/2", "2 / 2"). The "n of m" /
+# "n von m" word forms were dropped: they match receipt prose ("3 of 5
+# copies") and folded receipts into the main sheet; genuine word-form
+# continuations are still recovered by the D08 always-2-page fallback.
 PAGE_MARKER_PAT = re.compile(r"\b([1-9])\s*/\s*([1-9])\b")
 
 # Receipt-like keyword fingerprints (third-party documents). Used by the
@@ -404,9 +326,7 @@ RECEIPT_PAT = re.compile(
     r"jumlah|tanggal|bayar|terbilang|harga|"
     r"qty|menge|preis|tax\s+invoice|"
     r"item\s+description|unit\s+price|"
-    # Telecom prepaid scratch cards (Timor-Leste, Indonesia). These are
-    # legitimately "receipts" because they're third-party purchase proof,
-    # not internal supporting documents.
+    # Telecom prepaid scratch cards -- third-party purchase proof, so _2.
     r"prepaid|scratch[\s\-]?card|"
     r"telemor|telkomcel|timor[\s\-]?telecom|"
     r"sosa\s+pakote|fasil\s+liu|ransu|folin|"
@@ -417,13 +337,10 @@ RECEIPT_PAT = re.compile(
     re.I,
 )
 
-# STRONG receipt phrases: so unambiguously receipt-specific that a SINGLE
-# hit is enough to keep a page in the receipt bucket. These rescue real
-# receipts whose photo-region score is inflated by round stamps / paid
-# seals / halftone logos (e.g. a "PAYMENT RECEIPT" with circular cantina
-# stamps) but whose body OCR is too garbled to yield two ordinary receipt
-# keywords. None of these phrases occur on the photos / ID cards /
-# declaration letters we want routed to supporting.
+# STRONG receipt phrases: a SINGLE hit keeps the page in _2. Rescues real
+# receipts whose photo score is inflated by stamps/seals/logos but whose
+# garbled OCR yields fewer than two ordinary keywords. None occur on the
+# photos / ID cards / letters we route to supporting.
 STRONG_RECEIPT_PAT = re.compile(
     r"payment\s+receipt|payment\s+received|cash\s+receipt|official\s+receipt|"
     r"tax\s+invoice|\binvoice\b|"
@@ -453,14 +370,10 @@ SUPPORTING_PAT = re.compile(
 # A clock-time slot like "08:30 - 09:00" is a strong agenda/itinerary signal.
 TIME_SLOT_PAT = re.compile(r"\b\d{1,2}[:.]\d{2}\s*[-–]\s*\d{1,2}[:.]\d{2}\b")
 
-# Official letters / declarations (NOT receipts). These are internal
-# supporting documents -- e.g. a "Karta Deklarasaun" (declaration letter)
-# certifying vehicle ownership, an authorization letter, an Indonesian
-# "surat keterangan". The vocabulary below is specific to formal
-# correspondence and does not occur on third-party purchase receipts, so
-# a SINGLE hit is enough to route the page to supporting. (Generic words
-# like "authorization" that could appear on card receipts are excluded;
-# we keep the Tetum/Portuguese/Indonesian declaration-specific forms.)
+# Official letters / declarations ("Karta Deklarasaun", authorization
+# letters, "surat keterangan") are internal supporting docs. The vocabulary
+# is correspondence-specific and absent from purchase receipts, so a SINGLE
+# hit routes to supporting (generic words like "authorization" excluded).
 OFFICIAL_LETTER_PAT = re.compile(
     r"deklarasaun|deklara\s+katak|karta\s+deklara|"
     r"letter\s+of\s+declaration|carta\s+de\s+declara|declaration\s+letter|"
@@ -469,18 +382,13 @@ OFFICIAL_LETTER_PAT = re.compile(
     re.I,
 )
 
-# Contracts / formal agreements (NOT receipts). A consultancy or service
-# contract attached to a voucher (e.g. the FSP-DE "Consultancy Contract"
-# package: cover page, payment terms, general conditions, acceptance page)
-# is an internal supporting document (_3). Its payment clauses legitimately
-# contain receipt vocabulary ("upon submission of a detailed invoice",
-# totals, reimbursable-expense lists), which used to pull those pages into
-# the receipt bucket, so the phrases below are TITLE / legal-boilerplate
-# signals that occur on contract pages but never on third-party purchase
-# receipts -- a SINGLE hit routes the page to supporting (mirrors
-# OFFICIAL_LETTER_PAT). Bare "contract" / "contract no." are deliberately
-# NOT matched: utility invoices print "Contract No." and the consultant
-# fee invoices in these bundles say "contracted total 20 days".
+# Contracts / formal agreements are supporting (_3). Their payment clauses
+# legitimately contain receipt vocabulary ("upon submission of a detailed
+# invoice", totals), which used to pull them into _2 -- so these are TITLE /
+# legal-boilerplate phrases that never occur on purchase receipts; a SINGLE
+# hit routes to supporting. Bare "contract" / "contract no." deliberately
+# NOT matched (utility invoices print "Contract No.", consultant invoices
+# say "contracted total 20 days").
 CONTRACT_PAT = re.compile(
     r"consultancy\s+contract|consulting\s+service\s+contract|"
     r"contract\s+acceptance|hereinafter\s+referred|"
@@ -493,13 +401,10 @@ CONTRACT_PAT = re.compile(
     re.I,
 )
 
-# Receipt TITLE phrases -- the gate that keeps a GENUINE receipt in _2 even
-# when its line items reference the contract it bills against ("as per
-# consultancy contract"). Deliberately NARROWER than STRONG_RECEIPT_PAT:
-# bare "invoice" is excluded because contract payment clauses say "upon
-# submission of a detailed invoice", and that mention must not keep the
-# contract itself in the receipt bucket. Only phrases that function as a
-# receipt's own heading/stamp qualify.
+# Receipt TITLE phrases -- keep a GENUINE receipt in _2 even when it
+# references the contract it bills against. Narrower than STRONG_RECEIPT_PAT:
+# bare "invoice" is excluded because contract payment clauses mention
+# submitting one; only a receipt's own heading/stamp qualifies.
 RECEIPT_TITLE_PAT = re.compile(
     r"payment\s+receipt|payment\s+received|cash\s+receipt|official\s+receipt|"
     r"tax\s+invoice|\bfaktur\b|kwitansi|nota\s+no",
@@ -508,13 +413,11 @@ RECEIPT_TITLE_PAT = re.compile(
 
 
 def looks_like_contract(text: str) -> bool:
-    """True for a page of a contract / formal agreement (supporting, _3).
+    """Contract / formal-agreement page (-> supporting, _3).
 
-    A single CONTRACT_PAT title/boilerplate hit decides -- contract pages
-    routinely score ordinary receipt keywords in their payment clauses, so
-    (unlike looks_supporting) this is NOT weighed against receipt hits.
-    The only veto is RECEIPT_TITLE_PAT: a page that carries an actual
-    receipt heading is a receipt that merely references the contract.
+    One CONTRACT_PAT hit decides -- NOT weighed against ordinary receipt
+    keywords (payment clauses contain them legitimately). Only veto:
+    RECEIPT_TITLE_PAT, i.e. an actual receipt referencing the contract.
     """
     if not text:
         return False
@@ -523,17 +426,12 @@ def looks_like_contract(text: str) -> bool:
         return False
     return not RECEIPT_TITLE_PAT.search(norm)
 
-# Participant / attendance lists (signed lists attached to activity
-# vouchers) are SUPPORTING documents, but they OCR to little more than a
-# letterhead plus handwritten rows, so the multi-hit looks_supporting()
-# heuristic often misses them. Detected two ways (see looks_like_participant_list):
-#
-#  (a) TITLE -- an unambiguous single-hit signal, multi-lingual.
-#      NB: the bare phrase "participants list" is deliberately EXCLUDED -- the
-#      D08 activity voucher itself prints "attach a signed participants list",
-#      and matching that could mislabel a degraded D08. We match the list's
-#      own titles ("List of Participants", "Lista Partisipante", Portuguese
-#      "Lista Presença", Indonesian "Daftar Hadir", German attendance list).
+# Participant / attendance lists are SUPPORTING but OCR to little more than
+# a letterhead + handwritten rows, so looks_supporting() often misses them.
+# Detected two ways (see looks_like_participant_list):
+#  (a) TITLE -- single-hit, multi-lingual. The bare phrase "participants
+#      list" is EXCLUDED: the D08 form itself prints "attach a signed
+#      participants list" and could be mislabelled when degraded.
 PARTICIPANT_LIST_PAT = re.compile(
     r"list\s+of\s+participant|lista\s+partisipante|"
     r"lista\s+de\s+participantes|lista\s+(?:de\s+)?presen[cç]|"
@@ -542,31 +440,19 @@ PARTICIPANT_LIST_PAT = re.compile(
     re.I,
 )
 
-# Activity-report narrative pages. The report's TITLE page ("Activity
-# Report <activity name>") classifies as supporting via the multi-hit
-# looks_supporting heuristic, but its CONTINUATION pages are plain
-# narrative prose ("Through participatory activities and guided
-# self-reflection, teachers explored ...") with no form code and no
-# keywords at all, so they used to default to receipt. Handled by a
-# propagation pass analogous to the participant-list one (process_file
-# pass 1d): a supporting page containing the report title opens a block;
-# following receipt-default pages flip to supporting ONLY when they read
-# like narrative prose (>= REPORT_PROSE_MIN_TOKENS legible words) AND
-# carry zero receipt keywords. A garbled scratch-card / NOTA page (~20
-# legible words in these bundles) or any real receipt (>= 1 receipt
-# keyword) fails the gate, stays in _2 and ends the block.
+# Activity reports: the TITLE page classifies as supporting via the
+# multi-hit heuristic, but its continuations are plain narrative prose with
+# no keywords and used to default to receipt. Pass 1d propagates supporting
+# through them, gated on >= REPORT_PROSE_MIN_TOKENS legible words AND zero
+# receipt keywords -- a garbled receipt (~20 legible words) or a real one
+# (>= 1 keyword) fails the gate, stays in _2 and ends the block.
 REPORT_TITLE_PAT = re.compile(r"\bactivity\s+report\b", re.I)
 REPORT_PROSE_MIN_TOKENS = 50
 
-#  (b) STRUCTURE -- the typical column layout of such a list: a name column,
-#      a position/structure column, a signature/contact column, etc., laid
-#      out as a table. We recognise it by the COLUMN-HEADER vocabulary below;
-#      two or more DISTINCT column words on one page indicate a list table.
-#      These words are list-specific (Tetum form headers + Portuguese/English
-#      name/signature headers) and rare on receipts, so requiring two keeps
-#      false positives off invoices. A signed list usually also repeats the
-#      institutional header on each page, but the column headers are the
-#      structural fingerprint.
+#  (b) STRUCTURE -- >= 2 DISTINCT column-header words below (Tetum /
+#      Portuguese / English name, position, signature headers). They are
+#      list-specific and rare on receipts, so requiring two keeps false
+#      positives off invoices.
 PLIST_COL_PAT = re.compile(
     r"\b(?:naran|pozisaun|instituisaun|organizasaun|kontaktu|asinatura|"
     r"assinatura|tanda\s+tangan|nome\s+completo|estrutura|"
@@ -577,18 +463,12 @@ PLIST_COL_PAT = re.compile(
 
 
 def looks_like_participant_list(text: str) -> bool:
-    """True for a participant / attendance / signature list page.
+    """Participant / attendance / signature list page.
 
-    Matches either the list's TITLE (one hit, unambiguous) or its
-    structural COLUMN layout (>= 2 distinct list-column header words).
-    Used by identify_form's fall-through and as the trigger for the
-    continuation-propagation pass.
-
-    The structural branch is GATED by `not looks_like_receipt`: a
-    third-party receipt (e.g. a "FATURA / invoice and cash receipt") also
-    prints a customer "Naran / Name" field and an "Asinatura / signature"
-    line, so without this gate those columns would mis-flag the receipt as
-    a list. A real receipt's invoice/total keywords win and keep it in _2.
+    TITLE match (single hit) OR >= 2 distinct column-header words. The
+    structural branch is GATED by `not looks_like_receipt`: receipts also
+    print "Naran / Name" and "Asinatura / signature" fields, and their
+    invoice/total keywords must win and keep them in _2.
     """
     if not text:
         return False
@@ -619,19 +499,11 @@ FAHRTENBUCH_HASH = (
 )
 FAHRTENBUCH_THRESHOLD = 40   # 256-bit hash -- well below the ~120 baseline
 
-# Text-based Fahrtenbuch backup: handwritten / rotated / poorly-scanned
-# driver's-log pages can drift far enough from the template that the
-# perceptual hash misses them. We use TWO tiers of evidence:
-#
-#   Strong single-signal: the German-only words "Fahrtenbuch" or
-#   "lfd. Seite". Neither appears on any other form in the bundle, so
-#   either match is decisive.
-#
-#   Multi-marker consensus: at least two of the distinctive header /
-#   column markers below. Each individual marker can show up on other
-#   forms by coincidence (D17 procurement carries "project country:" too;
-#   D12 reimbursement-private-km mentions "logbook" and "licence plate"),
-#   but the combination is unique to Fahrtenbuch.
+# Text-based Fahrtenbuch backup for pages the perceptual hash misses.
+# Tier 1 (strong): German-only "Fahrtenbuch" / "lfd. Seite" -- decisive.
+# Tier 2 (consensus): >= 2 of the column/header markers below; singly they
+# occur on other forms (D17 "project country:", D12 "licence plate"), the
+# combination only on a driver's log.
 _FAHRTENBUCH_STRONG = re.compile(r"fahrtenbuch|lfd\.?\s*seite", re.I)
 _FAHRTENBUCH_WEAK_MARKERS = (
     r"licence\s+number(?!\s+plate)",   # NOT "licence plate" (D12)
@@ -645,13 +517,8 @@ _FAHRTENBUCH_WEAK_MARKERS = (
 
 
 def is_fahrtenbuch_text(text: str) -> bool:
-    """True when the OCR text reads like a Fahrtenbuch page.
-
-    Tier 1 (strong): German-only title/marker present -> always Fahrtenbuch.
-    Tier 2 (consensus): >= 2 of the distinctive column/header markers.
-                        Empirically zero false positives on D12 / D17 /
-                        all other voucher forms in the test bundles.
-    """
+    """OCR text reads like a Fahrtenbuch page (tiers above). Empirically
+    zero false positives on all other forms in the test bundles."""
     if not text:
         return False
     norm = text.lower()
@@ -679,12 +546,15 @@ def find_binary(names: list[str], extra_search: list[Path] | None = None) -> Opt
 
 
 def locate_tesseract() -> str:
-    extras: list[Path] = []
     if platform.system() == "Windows":
         extras = [
             Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
             Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
         ]
+    else:
+        # GUI-launched shells on macOS often miss /opt/homebrew/bin in PATH.
+        extras = [Path(p) / "tesseract"
+                  for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")]
     found = find_binary(["tesseract"], extras)
     if not found:
         sys.exit(
@@ -698,6 +568,9 @@ def locate_tesseract() -> str:
 
 def locate_ghostscript() -> str:
     extras: list[Path] = []
+    if platform.system() != "Windows":
+        extras = [Path(p) / "gs"
+                  for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")]
     if platform.system() == "Windows":
         # Ghostscript installs to versioned subdirs; pick the newest available.
         # Sort by PARSED version, not lexicographically -- string sorting puts
@@ -732,21 +605,19 @@ GHOSTSCRIPT: str = ""
 
 def _run_tesseract(png_path: Path, psm: int = 6,
                    whitelist: Optional[str] = None) -> str:
-    # Force UTF-8 decoding and replace undecodable bytes so we never bubble
-    # up a None / UnicodeDecodeError on Windows (default cp1252) when the
-    # OCR output contains non-ASCII glyphs from scanned receipts.
     args = [TESSERACT, str(png_path), "-", "-l", "eng", "--psm", str(psm)]
     if whitelist:
         args.extend(["-c", f"tessedit_char_whitelist={whitelist}"])
     out = subprocess.run(args, capture_output=True, timeout=180)
-    # A non-zero exit (missing langpack, OOM-killed child, bad PSM) yields
-    # empty stdout that is indistinguishable from "blank page" and would
-    # silently disable every detector. Surface it as a one-line stderr
-    # warning, but do NOT raise -- one bad page must not abort the file.
+    # Non-zero exit yields empty stdout, indistinguishable from a blank
+    # page and silently disabling every detector -- surface a one-line
+    # warning but do NOT raise (one bad page must not abort the file).
     if out.returncode != 0:
         err = (out.stderr or b"").decode("utf-8", errors="replace").strip()
         last = err.splitlines()[-1] if err else f"exit code {out.returncode}"
         print(f"  !! tesseract failed on {png_path.name}: {last}", file=sys.stderr)
+    # UTF-8 with replacement: Windows (cp1252) must never raise on
+    # non-ASCII glyphs from scanned receipts.
     raw = out.stdout or b""
     return raw.decode("utf-8", errors="replace")
 
@@ -755,10 +626,8 @@ def ocr_page(page: fitz.Page, dpi: int = OCR_DPI, psm: int = 6,
              clip: Optional[fitz.Rect] = None,
              whitelist: Optional[str] = None) -> str:
     pix = page.get_pixmap(dpi=dpi, clip=clip) if clip else page.get_pixmap(dpi=dpi)
-    # NB: on Windows, NamedTemporaryFile keeps an OS-level lock on the file
-    # while its handle is open, which prevents PyMuPDF's pix.save() from
-    # overwriting it. Use mkstemp + immediate close so the path is reserved
-    # but no handle is held while we write/read it.
+    # mkstemp + immediate close: NamedTemporaryFile would hold a Windows
+    # lock that blocks pix.save() from writing the path.
     fd, name = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     tmp = Path(name)
@@ -784,13 +653,11 @@ def page_phash(page: fitz.Page, size: int = 16) -> str:
 
 
 def hamming(a: str, b: str) -> int:
-    # NB: the comparison over the overlapping prefix (via zip) is
-    # INTENTIONAL and load-bearing. FAHRTENBUCH_HASH is 272 bits (its
-    # template was captured at a 16x17 grid) while page_phash() returns
-    # 256 bits (16x16); the Fahrtenbuch check relies on comparing the
-    # aligned top 16 rows. A landscape driver's log whose OCR and footer
-    # are unreadable is detected by THIS hash alone, so do not "guard"
-    # unequal lengths away -- doing so silently drops those pages.
+    # INTENTIONAL prefix comparison (zip stops at the shorter string):
+    # FAHRTENBUCH_HASH is 272 bits (16x17 template) vs page_phash's 256
+    # (16x16); the check relies on the aligned top 16 rows. A landscape
+    # driver's log with unreadable text is caught by THIS hash alone --
+    # do NOT "guard" unequal lengths away or those pages are dropped.
     return sum(x != y for x, y in zip(a, b))
 
 
@@ -802,15 +669,11 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
     """Return (form_code, category) for an OCR'd page.
 
     Match order (most -> least confident):
-      0. Extension-List override -- the D09 title "Extension-List to
-         Activity-voucher" contains "Activity-voucher", which would
-         otherwise be captured by the D08 body fingerprint. Resolve it
-         first so an extension list is never mistaken for a D08 main.
-      1. Footer D-code regex (highest confidence) -- the printed voucher
-         code, e.g. "(D 08)".
-      1b. D08 activity-voucher CONTENT fallback -- used ONLY when the
-         footer yielded no D-code (see below).
-      2. Body keyword fallback (used only if no footer matched).
+      0. Extension-List title override (contains "Activity-voucher" and
+         would otherwise be captured by the D08 body fingerprint).
+      1. Footer D-code regex (highest confidence; always wins).
+      1b. D08 header-content fallback, only when no footer code matched.
+      2. Body keyword fallback.
     """
     norm = " ".join((text or "").lower().split())
     # Pass 0 -- extension-list title/footer override (D09 supporting).
@@ -820,36 +683,22 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
     for code, (footer_re, _body_re, cat) in FORM_PATTERNS.items():
         if footer_re.search(norm):
             return code, _resolve_category(cat, norm)
-    # Pass 1b -- D08 activity-voucher CONTENT fallback.
-    #   The newer "(D08+D09 extension list)" template prints its FILE PATH
-    #   in the footer; that path text both (a) fails the D08 footer code
-    #   "(D08)" -- so Pass 1 finds nothing -- and (b) contains the literal
-    #   words "extension list", which the D09 body fingerprint would grab
-    #   in Pass 2 whenever the "Activity-voucher" title OCRs poorly,
-    #   silently misfiling the activity voucher as a D09 supporting page.
-    #   So, ONLY when the footer gave no D-code, fall back to the activity
-    #   voucher's HEADER fields (Theme/Titel, Topic of the activity,
-    #   5. Activities) -- markers that appear on the activity-voucher
-    #   page 1 but NEVER on the D09 extension list (which shares the
-    #   A./C. budget-table headers, so those can't be used here). The
-    #   page-2 continuation is picked up afterwards by the D08 always-2-page
-    #   post-pass. A clearly-read footer D-code above always takes priority;
-    #   the proper user-side fix is to keep the printed voucher code in the
-    #   footer clear of the file path.
+    # Pass 1b -- D08 CONTENT fallback, only when the footer gave no D-code.
+    #   The newer D08 template prints its FILE PATH in the footer: Pass 1
+    #   then finds no "(D08)", and the path's literal "extension list"
+    #   would let the D09 body pat grab the page in Pass 2 whenever the
+    #   title OCRs poorly. So match the activity-voucher HEADER fields
+    #   instead -- present on D08 page 1, never on the D09 list. Page 2
+    #   is recovered by the always-2-page post-pass.
     if D08_ACTIVITY_HEADER_PAT.search(norm):
         return "D08", "main"
     # Pass 2 -- body keyword fallback.
     for code, (_footer_re, body_re, cat) in FORM_PATTERNS.items():
         if body_re.search(norm):
             return code, _resolve_category(cat, norm)
-    # No D-code recognised. Default is "receipt", but check first whether
-    # the page reads like an internal supporting document (participant
-    # list, contract, workshop agenda/itinerary, etc.) which would
-    # otherwise be mis-categorised when the user stacks the bundle as
-    # main / supporting / receipts instead of main / receipts / supporting.
-    # Official letters / declarations, contracts / formal agreements,
-    # participant/attendance lists (by title OR table structure) and the
-    # multi-hit agenda/participant heuristic all route to supporting.
+    # No D-code: default receipt, but route internal supporting documents
+    # (official letters, contracts, participant lists by title or column
+    # structure, agenda/itinerary keyword consensus) to supporting first.
     if (OFFICIAL_LETTER_PAT.search(norm)
             or looks_like_contract(norm)
             or looks_like_participant_list(norm)
@@ -863,10 +712,8 @@ def _resolve_category(cat: str, norm: str) -> str:
         # D10 travel voucher: page 1 carries the travel-purpose phrases.
         return "main" if D10_PAGE1_PAT.search(norm) else "main_cont"
     if cat == "main_or_cont_d08":
-        # D08 activity voucher: a page is the 2nd (continuation) page only
-        # when it shows the page-2 budget tables (C/D/E) AND none of the
-        # page-1 markers. Anything else is treated as a page-1 main, so a
-        # standalone or page-1 D08 still starts a new voucher.
+        # Continuation only with page-2 tables AND no page-1 markers;
+        # anything else starts a new voucher as a page-1 main.
         if D08_PAGE2_PAT.search(norm) and not D08_PAGE1_PAT.search(norm):
             return "main_cont"
         return "main"
@@ -876,32 +723,15 @@ def _resolve_category(cat: str, norm: str) -> str:
 def extract_voucher_number(page: fitz.Page,
                            expected_range: Optional[tuple[int, int]] = None
                            ) -> Optional[int]:
-    """OCR the top-right of *page* and pull out the 'Voucher N°' value.
+    """OCR the top-right of *page*; return the 'Voucher N°' value or None.
 
-    Voucher numbers are often handwritten (especially in this project where
-    field staff fill them in by hand). Standard prose OCR (PSM 6) reads
-    handwriting unreliably -- "561" gets misread as "54", "S6/", "$6/" etc.
-    To make this robust:
-
-      1. We OCR a *narrow* crop (just the "Voucher N°" cell) at high DPI
-         under THREE Tesseract layout modes:
-           PSM 7  - treat region as a single text line
-           PSM 8  - treat region as a single word
-           PSM 11 - sparse text, no orientation assumptions
-      2. PSM 8 + 7 are run with a digit-only whitelist
-         (`tessedit_char_whitelist=0123456789`). This drops noise glyphs
-         like "S", "$", "/", "O" that handwriting often gets confused for.
-      3. The general PSM 6 pass (including the "Voucher N°" label match)
-         is kept as a fourth signal so a printed-number form still works.
-      4. We collect every plausible candidate (2-4 digits, in range
-         [1, 9999]) and:
-           - prefer candidates within the bundle's expected range
-             ([range_start, range_end] from the filename); these are
-             almost certainly correct.
-           - among in-range candidates, take the most-frequent (multiple
-             PSMs agreeing is strong evidence).
-           - among out-of-range candidates, return None -- the sequential
-             fallback in process_file() will use the position instead.
+    Numbers are often handwritten, so a narrow high-DPI crop is OCR'd
+    under four layout modes: PSM 6 prose (catches printed forms) plus
+    PSM 7/8/11 with a digit-only whitelist (drops the S/$/O glyphs
+    handwriting is misread as). All plausible 2-4 digit candidates are
+    collected; in-range candidates (per the filename's range) win by
+    multi-PSM majority. A tie or an out-of-range-only read returns None
+    so the caller's sequential fallback takes over.
     """
     w, h = page.rect.width, page.rect.height
     clip = fitz.Rect(w * 0.55, h * 0.04, w, h * 0.20)
@@ -969,12 +799,10 @@ def extract_voucher_number(page: fitz.Page,
 
 
 def extract_page_marker(page: fitz.Page) -> Optional[tuple[int, int]]:
-    """OCR the bottom strip of *page*; return (k, n) if it shows 'k/n' / 'k of n'.
+    """OCR the bottom strip of *page*; return (k, n) for a 'k/n' marker.
 
-    Used to detect multi-page main forms (D08 typically prints "1/2", "2/2"
-    in the footer). The continuation page often loses its D-code title to
-    table-overlap during scanning, so the marker becomes the only reliable
-    way to keep both pages glued to the same _1 file.
+    Continuation pages often lose their D-code title to table overlap;
+    the marker is then the only signal gluing them to the same _1 file.
     """
     w, h = page.rect.width, page.rect.height
     clip = fitz.Rect(0, h * 0.88, w, h)
@@ -992,13 +820,9 @@ def extract_page_marker(page: fitz.Page) -> Optional[tuple[int, int]]:
 
 
 def is_low_signal(text: str) -> bool:
-    """OCR returned mostly garbage -- too few legible words to classify on.
-
-    Used (together with is_photo_page) to detect photos and badly-scanned
-    pages. Threshold (20 alphabetic tokens of length >= 3) sits below
-    what most forms and supporting docs produce, but receipts can also
-    fall below it -- so callers must combine this with another signal
-    before re-categorising the page.
+    """Too few legible words to classify on (< 20 alphabetic tokens).
+    Receipts can also fall below this -- callers must combine it with
+    another signal before re-categorising the page.
     """
     tokens = re.findall(r"[A-Za-z]{3,}", text or "")
     return len(tokens) < 20
@@ -1008,29 +832,16 @@ def is_low_signal(text: str) -> bool:
 # Photograph detection (largest contiguous continuous-tone region)
 # ---------------------------------------------------------------------------
 #
-# Why this approach (and why the old one failed):
-#   These scans store each page as MANY embedded image XObjects (tiles,
-#   masks, layers -- 6 to 49 per page in real bundles). Extracting "the"
-#   embedded image and measuring it is unreliable: the largest-area
-#   fragment is frequently NOT the visible scan, so the old stdev/midtone
-#   numbers were measuring noise. We therefore RENDER the page (MuPDF is
-#   bundled identically in every PyMuPDF wheel, so a fixed-DPI render is
-#   deterministic across macOS/Linux/Windows) and analyse what is actually
-#   printed.
-#
-# What distinguishes a photograph from a document/receipt:
-#   A photo has a LARGE CONTIGUOUS region of continuous-tone (mid-gray)
-#   pixels. A text document is bimodal (black ink on white) with almost
-#   no mid-grays; a receipt's mid-grays (logos, halftone, coloured text)
-#   are small and SCATTERED. So we measure the size of the single largest
-#   connected blob of "continuous-tone" blocks -- big for photos, tiny
-#   for documents. Halftone-heavy printed receipts (telecom scratch
-#   cards) also score high here, but they are excluded by the
-#   looks_like_receipt() text gate at the call site.
-#
-# Cross-OS robustness: block-averaging (each block ~= 144 rendered
-# pixels) plus a wide acceptance band and a ~2x threshold margin absorb
-# any sub-pixel rasteriser differences between platform builds.
+# These scans embed MANY image XObjects per page (6-49 in real bundles),
+# so measuring "the" extracted image is unreliable. Instead RENDER the page
+# (MuPDF is bundled identically in every PyMuPDF wheel -> a fixed-DPI
+# render is deterministic across OSes) and measure the single largest
+# connected blob of continuous-tone (mid-gray) blocks: large for photos
+# and ID cards, ~zero for bimodal text documents, small and SCATTERED for
+# receipt logos/halftone. Halftone-heavy printed receipts also score high;
+# the looks_like_receipt() text gate at the call site keeps them in _2.
+# Block-averaging, the wide tone band and a ~2x threshold margin absorb
+# sub-pixel rasteriser differences between platform builds.
 
 _PHOTO_RENDER_DPI = 100      # fixed -> identical pixel grid on every OS
 _PHOTO_BLOCK = 12            # render-pixels per analysis block
@@ -1068,12 +879,10 @@ def _largest_blob(mask: list[int], w: int, h: int) -> int:
 
 
 def photo_region_score(page: fitz.Page) -> float:
-    """Fraction of the page covered by the single largest contiguous
-    continuous-tone region. High for photographs, ~0 for text documents.
-
-    Deterministic across operating systems: fixed-DPI MuPDF render ->
-    Pillow LUT mask -> Pillow BOX downsample to blocks -> pure-Python
-    connected-components. See the module comment above for rationale.
+    """Fraction of the page covered by the largest contiguous
+    continuous-tone region -- high for photographs, ~0 for text.
+    Deterministic across OSes (fixed-DPI render, LUT mask, BOX
+    downsample, pure-Python connected components).
     """
     try:
         pix = page.get_pixmap(dpi=_PHOTO_RENDER_DPI, colorspace=fitz.csGRAY)
@@ -1107,24 +916,12 @@ def is_photo_page(page: fitz.Page) -> bool:
 
 
 def looks_like_receipt(text: str) -> bool:
-    """True if the page text contains strong, unambiguous receipt keywords.
+    """Text contains unambiguous receipt keywords (gate for the photo flip).
 
-    Used as a positive override against the photo flip: a colourful page
-    full of telecom scratch-card art (high midtones, looks photo-like by
-    image content) but whose OCR clearly reads "telemor", "Konsulta saldu",
-    "Loron 30 days" should stay classified as a receipt -- not get flipped
-    to supporting just because the page is colourful.
-
-    Cross-OS-stable because it relies on POSITIVE matching of specific
-    multi-lingual keywords (which exist on real receipts) rather than
-    counting all OCR tokens (which varies wildly between Tesseract
-    versions, especially on photos).
-
-    Tiered: one STRONG, unambiguous receipt phrase (e.g. "payment
-    receipt", a telecom brand) suffices; otherwise we require at least
-    two ordinary receipt keywords. The strong tier rescues real receipts
-    whose photo-region score is inflated by stamps / seals / logos but
-    whose OCR yields only a single ordinary keyword.
+    POSITIVE multi-lingual matching -- stable across Tesseract versions,
+    unlike token counting. Tiered: one STRONG phrase (receipt heading,
+    telecom brand) suffices; otherwise two ordinary keywords. Keeps
+    colourful printed receipts (scratch cards, stamped receipts) in _2.
     """
     if not text:
         return False
@@ -1135,13 +932,9 @@ def looks_like_receipt(text: str) -> bool:
 
 
 def looks_supporting(text: str) -> bool:
-    """Conservative heuristic for fall-through pages with no D-code footer.
-
-    Returns True only when the page reads like an internal supporting
-    document (participant list, workshop agenda/itinerary, session plan)
-    rather than a third-party receipt. Requires at least two supporting
-    signals AND for them to outweigh receipt signals -- so a real invoice
-    that happens to mention "presentation" once still classifies as receipt.
+    """Multi-hit heuristic for no-D-code pages: >= 2 supporting signals
+    (a time slot counts double) AND more of them than receipt hits -- an
+    invoice mentioning "presentation" once still classifies as receipt.
     """
     if not text:
         return False
@@ -1212,27 +1005,14 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
     doc = fitz.open(src_path)
 
     # 1. classify every page
-    #
-    # Per-page logic:
-    #   a) Fahrtenbuch detection: perceptual-hash similarity OR
-    #      text-based fingerprint (German "Fahrtenbuch", "driver's log",
-    #      etc.). Either one is enough -- text rescues hand-written /
-    #      rotated / poorly-scanned pages the hash misses.
-    #   b) OCR full page; identify form by D-code / body keyword.
-    #   c) OCR bottom strip for an "X/Y" page-number marker.
-    #   d) Photo flip: a receipt-default page that looks like a
-    #      photograph (image-content metrics) AND whose OCR text does
-    #      NOT contain strong receipt keywords gets re-categorised as
-    #      supporting. The receipt-keyword gate is positive matching
-    #      against multi-lingual receipt vocabulary -- it's stable
-    #      across OSes (unlike a token-count gate, which depends on
-    #      Tesseract version), and it stops colourful printed
-    #      documents (e.g. telecom prepaid scratch cards) from being
-    #      mis-flipped.
-    #   e) Backward-pull: a page with marker (k>=2, N) belongs to the
-    #      most recent main voucher form -- but ONLY if that main has
-    #      its OWN matching (1, N) marker AND no intervening page is
-    #      already advertising itself as (1, N) of something else.
+    #   a) Fahrtenbuch: hash first (cheap, no OCR), then text fallback.
+    #   b) full-page OCR -> identify_form (D-code / body keywords).
+    #   c) bottom-strip OCR -> "k/N" page marker.
+    #   d) photo flip: a receipt-default page that renders photo-like
+    #      flips to supporting unless strong receipt keywords veto it.
+    #   e) backward-pull: a (k>=2, N) page re-attaches to the most recent
+    #      main -- only if that main advertised its own (1, N) and no
+    #      intervening page claims a competing (1, N).
     expected_range = (range_start, range_end)
     page_info: list[dict] = []
     for i, page in enumerate(doc):
@@ -1245,12 +1025,8 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                     "photo_score": None, "phash": ph}
         else:
             text = ocr_page(page)
-            # (a, fallback) Fahrtenbuch via text -- catches pages whose
-            # template-deviation drove the hash off but whose form text
-            # is unmistakable. See is_fahrtenbuch_text() for the
-            # two-tier strong/consensus logic that avoids false
-            # positives on D12 ("logbook" / "licence plate") and D17
-            # ("project country" alone) pages.
+            # (a, fallback) Fahrtenbuch via text -- rescues pages whose
+            # template drift defeats the hash; see is_fahrtenbuch_text().
             if is_fahrtenbuch_text(text):
                 info = {"page": i, "form": "FAHRTENBUCH", "cat": "fahrtenbuch",
                         "vnum": None, "marker": None, "marker_tuple": None,
@@ -1259,12 +1035,8 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                 form, cat = identify_form(text)
                 marker_tuple = extract_page_marker(page)
 
-                # (d) photo-like receipt-default page -> supporting,
-                #     gated by absence of strong receipt keywords. The
-                #     photo score is the largest contiguous continuous-
-                #     tone region (see photo_region_score); the text gate
-                #     keeps printed receipts (incl. telecom scratch cards,
-                #     which also score high) in the receipt bucket.
+                # (d) photo flip, gated by the receipt-keyword veto (see
+                #     photo_region_score / looks_like_receipt).
                 pscore = photo_region_score(page) if cat == "receipt" else None
                 if pscore is not None:
                     if pscore > _PHOTO_REGION_MIN and not looks_like_receipt(text):
@@ -1319,17 +1091,10 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
         print(f"  p{i+1:02d}  {info['cat']:<11}  form={str(info['form'] or '-'):<5}  "
               f"vnum={vn_disp:<5}{marker_disp}{photo_disp}  {snippet}")
 
-    # 1b. Post-pass: D08 always-2-page rule.
-    #     D08 (Activity-voucher) is a TWO-page form by template: page 1
-    #     carries the activity header and budget tables A/B (Transport,
-    #     Accommodation), page 2 carries tables C/D/E (Meals, Fees,
-    #     Miscellanous). The page-2 footer often gets garbled in scans
-    #     (table-overlap, light "(D08)" footer text), so it lands as
-    #     supporting/receipt by content alone.
-    #     We force the continuation, preferring marker-based detection
-    #     (any subsequent (2, N) marker before the next main) and falling
-    #     back to "the immediately next non-main page" for canonical-order
-    #     bundles where the marker OCR also failed.
+    # 1b. Post-pass: D08 is a 2-page form by template, but the page-2
+    #     footer often garbles and lands as supporting/receipt. Force the
+    #     continuation: marker-based first (handles scrambled bundles),
+    #     else the immediately-next non-main page (canonical order).
     for i, info in enumerate(page_info):
         if info.get("form") == "D08" and info["cat"] == "main":
             # bound: stop at next main / fahrtenbuch / skip
@@ -1358,15 +1123,10 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                 print(f"  -> p{cont_idx+1:02d} forced to main_cont "
                       f"(D08 continuation of p{i+1:02d})")
 
-    # 1c. Post-pass: detect duplicate consecutive main pages.
-    #     Field staff occasionally scan the same voucher form twice
-    #     (carbon copy + signed original, or accidental rescan).
-    #     Two consecutive "main" pages of the same form code with very
-    #     similar perceptual hashes are almost certainly duplicates of
-    #     the same voucher; we merge by demoting the second to main_cont.
-    #     Threshold (hamming < 35 of 256 bits) is lenient enough to
-    #     absorb signature/stamp differences but tight enough to avoid
-    #     false merges of two legitimate sequential vouchers.
+    # 1c. Post-pass: duplicate consecutive mains (accidental rescans).
+    #     Same form code + hamming < 35/256 (lenient enough for signature/
+    #     stamp differences, tight enough not to merge two real vouchers)
+    #     -> demote the second to main_cont.
     for i in range(len(page_info) - 1):
         a, b = page_info[i], page_info[i + 1]
         if (a["cat"] == "main" and b["cat"] == "main"
@@ -1374,35 +1134,19 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
             ph_a, ph_b = a.get("phash"), b.get("phash")
             if ph_a and ph_b and hamming(ph_a, ph_b) < 35:
                 b["cat"] = "main_cont"
-                if not b.get("form"):
-                    b["form"] = "FORCED"
                 print(f"  -> p{b['page']+1:02d} forced to main_cont "
                       f"(duplicate scan of p{a['page']+1:02d})")
 
     # 1d. Post-pass: participant-list / activity-report continuation
-    #     propagation.
-    #     A multi-page signed participant/attendance list is detectable on
-    #     its first (titled / column-headed) page, but the continuation
-    #     pages OCR to little more than handwriting and would default to
-    #     "receipt". Likewise an activity report is detectable by its
-    #     title page, while its continuation pages are plain narrative
-    #     prose with no keywords at all. Per the bundle convention
-    #     (main -> receipts -> supporting) and the user's rule that both
-    #     document types are always _3, once a list/report page is seen we
-    #     carry "supporting" forward through the immediately-following
-    #     receipt-default pages until the block clearly ends.
-    #     Strictly bounded so it never swallows a real receipt:
-    #       - starts ONLY at a detected participant-list page (is_plist)
-    #         or a supporting-classified activity-report page (is_report),
-    #       - a LIST block propagates only to "receipt" pages WITHOUT
-    #         strong receipt keywords (a real invoice/slip breaks the run
-    #         and stays _2),
-    #       - a REPORT block is stricter: only to pages that read like
-    #         narrative prose AND carry ZERO receipt keywords
-    #         (report_prose flag) -- a garbled low-text receipt does not
-    #         qualify,
-    #       - resets at any main/continuation/fahrtenbuch/skip boundary and
-    #         at any other supporting page (photo, itinerary).
+    #     propagation. Both document types are detectable on their first
+    #     page only; continuations OCR to handwriting / plain prose and
+    #     would default to receipt. Once a list/report page is seen, carry
+    #     "supporting" forward through following receipt-default pages.
+    #     Bounded so it never swallows a real receipt: a LIST block skips
+    #     pages with strong receipt keywords; a REPORT block additionally
+    #     requires narrative prose with ZERO receipt keywords
+    #     (report_prose). Any main/fahrtenbuch/skip boundary or other
+    #     supporting page (photo, itinerary) resets the block.
     block = None  # None | "plist" | "report"
     for info in page_info:
         cat = info["cat"]
@@ -1425,14 +1169,9 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
         else:
             block = None                      # strong receipt / other doc ends it
 
-    # 2. group pages into voucher buckets (one per main)
-    #
-    # Voucher numbering: when extract_voucher_number() returned a value
-    # within the expected range we trust it. When it returned None we
-    # use sequential numbering anchored to range_start: this is robust
-    # to the common case of handwritten numbers that defeat OCR -- the
-    # filename's range is the ground truth, and walking it in page order
-    # always produces the right numbers as long as no main was missed.
+    # 2. group pages into voucher buckets (one per main). In-range OCR
+    #    numbers are trusted; otherwise sequential numbering anchored to
+    #    range_start (the filename is ground truth for a contiguous bundle).
     groups: list[dict] = []
     deferred_fahrtenbuch: list[int] = []
     next_seq = range_start
@@ -1455,10 +1194,8 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
             continue
         if cat == "main":
             vnum = info["vnum"] if info["vnum"] is not None else next_seq
-            # Advance the positional counter by exactly one per main, NEVER
-            # re-anchored to the OCR read. A single wrong-but-in-range read
-            # then mislabels only its own page instead of shifting (and
-            # possibly colliding) every later voucher number.
+            # Advance exactly once per main, NEVER re-anchored to the OCR
+            # read -- a wrong read then mislabels only its own page.
             next_seq += 1
             groups.append({"vnum": vnum, "form": info["form"],
                            "main": [i], "receipt": [], "supporting": []})
@@ -1491,13 +1228,10 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
             print(f"  driver's log p{[p+1 for p in deferred_fahrtenbuch]} -> "
                   f"ignored (no D12 voucher in this file)")
 
-    # 3b. Guard against duplicate voucher numbers. A wrong-but-in-range OCR
-    #     read can land on another main's number; two groups sharing a vnum
-    #     would write the same Q..._6_Voucher_<vnum>_*.pdf and the second
-    #     would silently overwrite the first (Ghostscript -sOutputFile
-    #     truncates). On any collision, fall back to position-based
-    #     sequential numbering from range_start -- the filename range is the
-    #     ground truth for a contiguous bundle -- so every output is unique.
+    # 3b. Duplicate voucher numbers (a wrong-but-in-range OCR read) would
+    #     silently overwrite output files (gs -sOutputFile truncates).
+    #     On any collision renumber every group sequentially from
+    #     range_start so each output is unique.
     vnums = [g["vnum"] for g in groups]
     if len(set(vnums)) != len(vnums):
         print(f"  !! WARNING: duplicate voucher numbers {vnums} -- "
@@ -1515,14 +1249,9 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
     out_dir = src_path.parent
     for g in groups:
         vnum = g["vnum"]
-        # Flag vouchers that end up with no _2 receipt file. A faint
-        # receipt glued onto the voucher page (a scanning user-error) is
-        # NOT reliably detectable on the page itself -- it OCRs to almost
-        # nothing and carries no continuous-tone content -- so the only
-        # robust signal is structural: the voucher has a main but no
-        # separate receipt. The page is still (correctly) sorted to _1;
-        # this flag prompts the operator to check whether a receipt was
-        # glued onto the voucher sheet or is genuinely missing.
+        # A receipt glued onto the voucher sheet (scan user-error) is not
+        # detectable on the page itself; the structural signal -- a main
+        # with no separate _2 receipt -- prompts the operator to check.
         no_receipt = "  [!] no _2 receipt -- receipt may be glued onto the voucher page or missing" \
             if not g["receipt"] else ""
         print(f"  voucher {vnum}: main={[p+1 for p in g['main']]}, "
@@ -1566,7 +1295,12 @@ def main() -> None:
     print(f"using ghostscript: {GHOSTSCRIPT}")
 
     if args.pdfs:
-        pdfs = args.pdfs
+        pdfs = []
+        for p in args.pdfs:
+            if p.is_file():
+                pdfs.append(p)
+            else:
+                print(f"!! skipping missing file: {p}", file=sys.stderr)
     else:
         if not args.folder.exists():
             sys.exit(f"Folder not found: {args.folder}")
