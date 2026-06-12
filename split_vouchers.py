@@ -53,7 +53,13 @@ Classification logic (most -> least specific)
 3. Pages without a recognised D-code are checked against a supporting-
    document keyword fingerprint (participant lists, workshop agendas /
    itineraries, session plans, multi-lingual). A conservative match
-   flips the page from the RECEIPT default to SUPPORTING. Pages that
+   flips the page from the RECEIPT default to SUPPORTING. Contract /
+   formal-agreement pages (e.g. a multi-page "Consultancy Contract"
+   whose payment clauses mention invoices, totals and reimbursable
+   expenses) are recognised by title / legal-boilerplate phrases and
+   routed to SUPPORTING -- unless the page carries an actual receipt
+   heading, in which case it is a receipt that merely references the
+   contract (see looks_like_contract). Pages that
    look like photographs are also flipped to SUPPORTING -- BUT ONLY if
    the OCR text does not contain strong receipt keywords. Photograph
    detection RENDERS the page (deterministic across OS) and measures the
@@ -463,6 +469,60 @@ OFFICIAL_LETTER_PAT = re.compile(
     re.I,
 )
 
+# Contracts / formal agreements (NOT receipts). A consultancy or service
+# contract attached to a voucher (e.g. the FSP-DE "Consultancy Contract"
+# package: cover page, payment terms, general conditions, acceptance page)
+# is an internal supporting document (_3). Its payment clauses legitimately
+# contain receipt vocabulary ("upon submission of a detailed invoice",
+# totals, reimbursable-expense lists), which used to pull those pages into
+# the receipt bucket, so the phrases below are TITLE / legal-boilerplate
+# signals that occur on contract pages but never on third-party purchase
+# receipts -- a SINGLE hit routes the page to supporting (mirrors
+# OFFICIAL_LETTER_PAT). Bare "contract" / "contract no." are deliberately
+# NOT matched: utility invoices print "Contract No." and the consultant
+# fee invoices in these bundles say "contracted total 20 days".
+CONTRACT_PAT = re.compile(
+    r"consultancy\s+contract|consulting\s+service\s+contract|"
+    r"contract\s+acceptance|hereinafter\s+referred|"
+    r"terms\s+and\s+conditions\s+of\s+(?:this|the)\s+contract|"
+    r"termination\s+of\s+(?:this|the)\s+contract|"
+    r"terms\s+of\s+reference|"
+    r"contrato\s+de\s+(?:presta[cç]|consultoria|servi[cç]|trabalho)|"
+    r"kontratu\s+(?:serbisu|konsultoria)|"
+    r"surat\s+perjanjian|perjanjian\s+kerja",
+    re.I,
+)
+
+# Receipt TITLE phrases -- the gate that keeps a GENUINE receipt in _2 even
+# when its line items reference the contract it bills against ("as per
+# consultancy contract"). Deliberately NARROWER than STRONG_RECEIPT_PAT:
+# bare "invoice" is excluded because contract payment clauses say "upon
+# submission of a detailed invoice", and that mention must not keep the
+# contract itself in the receipt bucket. Only phrases that function as a
+# receipt's own heading/stamp qualify.
+RECEIPT_TITLE_PAT = re.compile(
+    r"payment\s+receipt|payment\s+received|cash\s+receipt|official\s+receipt|"
+    r"tax\s+invoice|\bfaktur\b|kwitansi|nota\s+no",
+    re.I,
+)
+
+
+def looks_like_contract(text: str) -> bool:
+    """True for a page of a contract / formal agreement (supporting, _3).
+
+    A single CONTRACT_PAT title/boilerplate hit decides -- contract pages
+    routinely score ordinary receipt keywords in their payment clauses, so
+    (unlike looks_supporting) this is NOT weighed against receipt hits.
+    The only veto is RECEIPT_TITLE_PAT: a page that carries an actual
+    receipt heading is a receipt that merely references the contract.
+    """
+    if not text:
+        return False
+    norm = text.lower()
+    if not CONTRACT_PAT.search(norm):
+        return False
+    return not RECEIPT_TITLE_PAT.search(norm)
+
 # Participant / attendance lists (signed lists attached to activity
 # vouchers) are SUPPORTING documents, but they OCR to little more than a
 # letterhead plus handwritten rows, so the multi-hit looks_supporting()
@@ -481,6 +541,22 @@ PARTICIPANT_LIST_PAT = re.compile(
     r"daftar\s+hadir|teilnehmerliste|anwesenheitsliste",
     re.I,
 )
+
+# Activity-report narrative pages. The report's TITLE page ("Activity
+# Report <activity name>") classifies as supporting via the multi-hit
+# looks_supporting heuristic, but its CONTINUATION pages are plain
+# narrative prose ("Through participatory activities and guided
+# self-reflection, teachers explored ...") with no form code and no
+# keywords at all, so they used to default to receipt. Handled by a
+# propagation pass analogous to the participant-list one (process_file
+# pass 1d): a supporting page containing the report title opens a block;
+# following receipt-default pages flip to supporting ONLY when they read
+# like narrative prose (>= REPORT_PROSE_MIN_TOKENS legible words) AND
+# carry zero receipt keywords. A garbled scratch-card / NOTA page (~20
+# legible words in these bundles) or any real receipt (>= 1 receipt
+# keyword) fails the gate, stays in _2 and ends the block.
+REPORT_TITLE_PAT = re.compile(r"\bactivity\s+report\b", re.I)
+REPORT_PROSE_MIN_TOKENS = 50
 
 #  (b) STRUCTURE -- the typical column layout of such a list: a name column,
 #      a position/structure column, a signature/contact column, etc., laid
@@ -768,13 +844,14 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
             return code, _resolve_category(cat, norm)
     # No D-code recognised. Default is "receipt", but check first whether
     # the page reads like an internal supporting document (participant
-    # list, workshop agenda/itinerary, etc.) which would otherwise be
-    # mis-categorised when the user stacks the bundle as
+    # list, contract, workshop agenda/itinerary, etc.) which would
+    # otherwise be mis-categorised when the user stacks the bundle as
     # main / supporting / receipts instead of main / receipts / supporting.
-    # Official letters / declarations, participant/attendance lists (by
-    # title OR table structure) and the multi-hit agenda/participant
-    # heuristic all route to supporting.
+    # Official letters / declarations, contracts / formal agreements,
+    # participant/attendance lists (by title OR table structure) and the
+    # multi-hit agenda/participant heuristic all route to supporting.
     if (OFFICIAL_LETTER_PAT.search(norm)
+            or looks_like_contract(norm)
             or looks_like_participant_list(norm)
             or looks_supporting(norm)):
         return None, "supporting"
@@ -1222,9 +1299,16 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                         "marker_tuple": marker_tuple,
                         "photo_score": pscore,
                         "phash": ph,
-                        # flags for the participant-list continuation pass
+                        # flags for the participant-list / activity-report
+                        # continuation passes (1d)
                         "is_plist": looks_like_participant_list(text),
-                        "strong_receipt": looks_like_receipt(text)}
+                        "strong_receipt": looks_like_receipt(text),
+                        "is_report": bool(REPORT_TITLE_PAT.search(text)),
+                        "report_prose": (
+                            not RECEIPT_PAT.search(text)
+                            and not looks_like_receipt(text)
+                            and len(re.findall(r"[A-Za-z]{3,}", text))
+                                >= REPORT_PROSE_MIN_TOKENS)}
 
         page_info.append(info)
         snippet = " ".join(text.split())[:80] if text else ""
@@ -1295,36 +1379,51 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                 print(f"  -> p{b['page']+1:02d} forced to main_cont "
                       f"(duplicate scan of p{a['page']+1:02d})")
 
-    # 1d. Post-pass: participant-list continuation propagation.
+    # 1d. Post-pass: participant-list / activity-report continuation
+    #     propagation.
     #     A multi-page signed participant/attendance list is detectable on
     #     its first (titled / column-headed) page, but the continuation
     #     pages OCR to little more than handwriting and would default to
-    #     "receipt". Per the bundle convention (main -> receipts ->
-    #     supporting, lists last) and the user's rule that participant
-    #     lists behave like the D09 extension list (always _3, attached to
-    #     the activity voucher), once a participant-list page is seen we
+    #     "receipt". Likewise an activity report is detectable by its
+    #     title page, while its continuation pages are plain narrative
+    #     prose with no keywords at all. Per the bundle convention
+    #     (main -> receipts -> supporting) and the user's rule that both
+    #     document types are always _3, once a list/report page is seen we
     #     carry "supporting" forward through the immediately-following
     #     receipt-default pages until the block clearly ends.
     #     Strictly bounded so it never swallows a real receipt:
-    #       - starts ONLY at a detected participant-list page (is_plist),
-    #       - propagates ONLY to "receipt" pages WITHOUT strong receipt
-    #         keywords (a real invoice/slip breaks the run and stays _2),
+    #       - starts ONLY at a detected participant-list page (is_plist)
+    #         or a supporting-classified activity-report page (is_report),
+    #       - a LIST block propagates only to "receipt" pages WITHOUT
+    #         strong receipt keywords (a real invoice/slip breaks the run
+    #         and stays _2),
+    #       - a REPORT block is stricter: only to pages that read like
+    #         narrative prose AND carry ZERO receipt keywords
+    #         (report_prose flag) -- a garbled low-text receipt does not
+    #         qualify,
     #       - resets at any main/continuation/fahrtenbuch/skip boundary and
-    #         at any non-participant supporting page (photo, itinerary).
-    in_plist_block = False
+    #         at any other supporting page (photo, itinerary).
+    block = None  # None | "plist" | "report"
     for info in page_info:
         cat = info["cat"]
         if cat in ("main", "main_cont", "fahrtenbuch", "skip"):
-            in_plist_block = False
+            block = None
         elif info.get("is_plist"):
-            in_plist_block = True            # already classified supporting
-        elif (cat == "receipt" and in_plist_block
+            block = "plist"                  # already classified supporting
+        elif cat == "supporting" and info.get("is_report"):
+            block = "report"
+        elif (cat == "receipt" and block == "plist"
               and not info.get("strong_receipt")):
             info["cat"] = "supporting"        # continuation of the list block
             print(f"  -> p{info['page']+1:02d} -> supporting "
                   f"(participant-list continuation)")
+        elif (cat == "receipt" and block == "report"
+              and info.get("report_prose")):
+            info["cat"] = "supporting"        # narrative continuation
+            print(f"  -> p{info['page']+1:02d} -> supporting "
+                  f"(activity-report continuation)")
         else:
-            in_plist_block = False            # strong receipt / other doc ends it
+            block = None                      # strong receipt / other doc ends it
 
     # 2. group pages into voucher buckets (one per main)
     #

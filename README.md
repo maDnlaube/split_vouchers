@@ -7,7 +7,7 @@ voucher, sorted into three categories:
 |---------------|----------|
 | `_1` | the main voucher form (Standard / Collective / Travel / Activity / Reimbursement-private-km) |
 | `_2` | the original third-party receipts, invoices and slips |
-| `_3` | supporting documents (driver's logs, extension lists, participant lists, ID cards, etc.) |
+| `_3` | supporting documents (driver's logs, extension lists, participant lists, contracts and offer letters, ID cards, etc.) |
 
 You drop a bundle named like `Q126_5_Vouchers_No_238-241.pdf` into the working
 folder, run one command, and the matching `Q126_6_Voucher_238_1.pdf`,
