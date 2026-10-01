@@ -54,6 +54,14 @@ Classification logic (most -> least specific)
 5. Duplicate consecutive mains (same D-code, near-identical hash, e.g.
    an accidental rescan) merge: the second page demotes to main_cont.
 
+6. Per-diem overview sheets (D22) come one per traveller, so a voucher
+   carries any number of them and all belong in _3. They are claimed by a
+   two-of-six template-marker consensus BEFORE any footer read, because
+   the sheet quotes "5. Activities" and a lost footer code otherwise let
+   the D08 fallback promote it to a main and invent a voucher. A sheet too
+   degraded for any marker is recovered by layout hash from its confirmed
+   neighbours in the run.
+
 Voucher numbering
 =================
 The top-right "Voucher N°" cell is OCR'd under four Tesseract layout
@@ -262,8 +270,13 @@ FORM_PATTERNS: dict[str, tuple[re.Pattern, re.Pattern, str]] = {
         "supporting",
     ),
     # --- TF2.3 Per-diem overview (supporting) --------------------------
+    # One sheet PER TRAVELLER, so a voucher carries any number of them. The
+    # newer template prints the SHEET COUNTER in the footer ("per diem (3)")
+    # instead of the D-code, so accept both forms; a sheet that loses its
+    # footer entirely is still caught by looks_like_per_diem_sheet().
     "D22": (
-        re.compile(rf"\(\s*d\s*{_D2}{_D2}\s*\)", re.I),
+        re.compile(rf"\(\s*d\s*{_D2}{_D2}\s*\)|"
+                   rf"per\s*d{_D1}em\s*\(\s*\d{{1,2}}\s*\)", re.I),
         re.compile(r"per\s+diem\s+overview", re.I),
         "supporting",
     ),
@@ -442,7 +455,7 @@ PARTICIPANT_LIST_PAT = re.compile(
 
 # Activity reports: the TITLE page classifies as supporting via the
 # multi-hit heuristic, but its continuations are plain narrative prose with
-# no keywords and used to default to receipt. Pass 1d propagates supporting
+# no keywords and used to default to receipt. Pass 1e propagates supporting
 # through them, gated on >= REPORT_PROSE_MIN_TOKENS legible words AND zero
 # receipt keywords -- a garbled receipt (~20 legible words) or a real one
 # (>= 1 keyword) fails the gate, stays in _2 and ends the block.
@@ -478,6 +491,39 @@ def looks_like_participant_list(text: str) -> bool:
     if looks_like_receipt(text):
         return False
     return len({m.group(0).strip() for m in PLIST_COL_PAT.finditer(norm)}) >= 2
+
+
+# Per-diem overview sheet (D22) -- ONE SHEET PER TRAVELLER, so a single
+# voucher carries an unbounded run of them and every one belongs in _3.
+# Two things made a run fall apart mid-way: the footer D-code OCRs away on
+# the newer template (which footers "per diem (N)" instead), AND the sheet
+# quotes the activity budget line "5. Activities" -- the exact marker
+# identify_form's footer-less D08 fallback keys on. A sheet that lost its
+# footer was therefore promoted to a D08 MAIN and opened a bogus voucher.
+# These markers are title/boilerplate text of the template itself; TWO must
+# agree so that one OCR fluke cannot pull a foreign page into _3.
+PER_DIEM_SHEET_MARKERS = (
+    re.compile(r"per\s*d[il1]em\s+overv[il1]ew", re.I),           # title, "...-voucher"
+    re.compile(r"calculat[il1][o0]n\s+template", re.I),           # "...and calculation template"
+    re.compile(r"per\s*d[il1]em[\s\-]*regulat[il1][o0]n", re.I),  # "(basis: vaild per diem-regulation"
+    re.compile(r"da[il1]ly\s+per\s*d[il1]em", re.I),              # "100% daily per diem / currency"
+    re.compile(r"val[il1]d\s+per\s*d[il1]em", re.I),              # "amount based on valid per diem-%"
+    re.compile(r"per\s*d[il1]em\s*\(\s*\d{1,2}\s*\)", re.I),      # footer sheet counter
+)
+PER_DIEM_MIN_MARKERS = 2
+# Layout-hash tolerance for the run-propagation pass. Measured on real
+# bundles: <=14 between sheets of one run, >=56 to the nearest page of any
+# other form -- so this sits in open space, not on a cliff edge.
+PER_DIEM_PHASH_MAX = 30
+
+
+def looks_like_per_diem_sheet(text: str, minimum: int = PER_DIEM_MIN_MARKERS) -> bool:
+    """Per-diem overview / calculation sheet -> always D22 supporting."""
+    if not text:
+        return False
+    norm = " ".join(text.lower().split())
+    return sum(bool(p.search(norm)) for p in PER_DIEM_SHEET_MARKERS) >= minimum
+
 
 # Source filename: Q<q><yy>_5_Vouchers_No_<start>-<end>.pdf
 # e.g. Q126_5_Vouchers_No_238-241.pdf, Q227_5_Vouchers_No_12-19.pdf
@@ -671,6 +717,8 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
     Match order (most -> least confident):
       0. Extension-List title override (contains "Activity-voucher" and
          would otherwise be captured by the D08 body fingerprint).
+      0b. Per-diem sheet override (quotes "5. Activities", so it would
+         otherwise be captured by the D08 header fallback).
       1. Footer D-code regex (highest confidence; always wins).
       1b. D08 header-content fallback, only when no footer code matched.
       2. Body keyword fallback.
@@ -679,6 +727,12 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
     # Pass 0 -- extension-list title/footer override (D09 supporting).
     if EXTENSION_LIST_PAT.search(norm):
         return "D09", "supporting"
+    # Pass 0b -- per-diem sheet override, ahead of the footer loop: these
+    # sheets are ALWAYS supporting, so no footer read can improve on this,
+    # while a garbled one ("(D22)" -> "(D12)") would turn the page into a
+    # main and split the voucher. See looks_like_per_diem_sheet().
+    if looks_like_per_diem_sheet(norm):
+        return "D22", "supporting"
     # Pass 1 -- footer D-code (preferred signal, always wins when present).
     for code, (footer_re, _body_re, cat) in FORM_PATTERNS.items():
         if footer_re.search(norm):
@@ -690,7 +744,10 @@ def identify_form(text: str) -> tuple[Optional[str], str]:
     #   title OCRs poorly. So match the activity-voucher HEADER fields
     #   instead -- present on D08 page 1, never on the D09 list. Page 2
     #   is recovered by the always-2-page post-pass.
-    if D08_ACTIVITY_HEADER_PAT.search(norm):
+    #   VETOED on even a SINGLE per-diem marker: promoting a page to a main
+    #   invents a voucher, so this fallback must stay the weaker signal.
+    if (D08_ACTIVITY_HEADER_PAT.search(norm)
+            and not looks_like_per_diem_sheet(norm, minimum=1)):
         return "D08", "main"
     # Pass 2 -- body keyword fallback.
     for code, (_footer_re, body_re, cat) in FORM_PATTERNS.items():
@@ -1071,8 +1128,10 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                         "marker_tuple": marker_tuple,
                         "photo_score": pscore,
                         "phash": ph,
+                        # anchor flag for the per-diem run pass (1b)
+                        "is_per_diem": looks_like_per_diem_sheet(text),
                         # flags for the participant-list / activity-report
-                        # continuation passes (1d)
+                        # continuation passes (1e)
                         "is_plist": looks_like_participant_list(text),
                         "strong_receipt": looks_like_receipt(text),
                         "is_report": bool(REPORT_TITLE_PAT.search(text)),
@@ -1091,7 +1150,33 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
         print(f"  p{i+1:02d}  {info['cat']:<11}  form={str(info['form'] or '-'):<5}  "
               f"vnum={vn_disp:<5}{marker_disp}{photo_disp}  {snippet}")
 
-    # 1b. Post-pass: D08 is a 2-page form by template, but the page-2
+    # 1b. Post-pass: per-diem RUN propagation. A voucher carries one
+    #     per-diem sheet per traveller and they are scanned consecutively,
+    #     so a sheet whose OCR is too poor for any text marker is still
+    #     identifiable by company: walk out from every text-confirmed sheet
+    #     and claim neighbours whose LAYOUT hash matches it. Runs FIRST so a
+    #     wrongly-promoted main is gone before the D08 continuation (1c) and
+    #     duplicate-merge (1d) passes can cascade off it. Demote-only, and
+    #     every claim is anchored to a confirmed sheet (never chained from
+    #     another claim), so drift cannot walk this into a real form.
+    for anchor in [i for i, p in enumerate(page_info) if p.get("is_per_diem")]:
+        for step in (1, -1):
+            j = anchor + step
+            while 0 <= j < len(page_info):
+                p = page_info[j]
+                if p.get("is_per_diem") or p["cat"] in ("fahrtenbuch", "skip"):
+                    break  # already correct, or a hard boundary
+                if (not p.get("phash") or not page_info[anchor].get("phash")
+                        or hamming(page_info[anchor]["phash"], p["phash"])
+                        > PER_DIEM_PHASH_MAX):
+                    break  # different form -- end of the run
+                was = p["cat"]
+                p["cat"], p["form"], p["is_per_diem"] = "supporting", "D22", True
+                print(f"  -> p{j+1:02d} {was} -> supporting "
+                      f"(per-diem sheet, layout matches p{anchor+1:02d})")
+                j += step
+
+    # 1c. Post-pass: D08 is a 2-page form by template, but the page-2
     #     footer often garbles and lands as supporting/receipt. Force the
     #     continuation: marker-based first (handles scrambled bundles),
     #     else the immediately-next non-main page (canonical order).
@@ -1123,7 +1208,7 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                 print(f"  -> p{cont_idx+1:02d} forced to main_cont "
                       f"(D08 continuation of p{i+1:02d})")
 
-    # 1c. Post-pass: duplicate consecutive mains (accidental rescans).
+    # 1d. Post-pass: duplicate consecutive mains (accidental rescans).
     #     Same form code + hamming < 35/256 (lenient enough for signature/
     #     stamp differences, tight enough not to merge two real vouchers)
     #     -> demote the second to main_cont.
@@ -1137,7 +1222,7 @@ def process_file(src_path: Path, dry_run: bool = False) -> None:
                 print(f"  -> p{b['page']+1:02d} forced to main_cont "
                       f"(duplicate scan of p{a['page']+1:02d})")
 
-    # 1d. Post-pass: participant-list / activity-report continuation
+    # 1e. Post-pass: participant-list / activity-report continuation
     #     propagation. Both document types are detectable on their first
     #     page only; continuations OCR to handwriting / plain prose and
     #     would default to receipt. Once a list/report page is seen, carry
