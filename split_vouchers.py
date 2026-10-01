@@ -1022,7 +1022,7 @@ def write_subset(src: fitz.Document, page_indices: list[int], out_path: Path) ->
         GHOSTSCRIPT,
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
-        "-dPDFSETTINGS=/ebook",
+        "-dPDFSETTINGS=/printer",
         "-dNOPAUSE", "-dQUIET", "-dBATCH",
         f"-sOutputFile={out_path}",
         str(tmp_pdf),
